@@ -1,0 +1,6 @@
+# Copy this file to ~/.config/outlook-triage/rules.yaml and edit it.
+# Matching is case-insensitive. Entries are exact unless documented otherwise.
+ignored_senders: []
+ignored_domains: []
+ignored_subject_patterns: []  # Regular expressions, for example: "^Weekly digest"
+
