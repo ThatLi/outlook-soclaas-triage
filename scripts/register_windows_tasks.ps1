@@ -28,9 +28,17 @@ foreach ($taskName in $taskNames) {
 $syncAction = New-ScheduledTaskAction -Execute $executable -Argument "sync" -WorkingDirectory $project
 $digestAction = New-ScheduledTaskAction -Execute $executable -Argument "digest" -WorkingDirectory $project
 
-$syncTrigger = New-ScheduledTaskTrigger -Daily -At "03:50"
-$syncTrigger.Repetition.Interval = "PT4H"
-$syncTrigger.Repetition.Duration = "P1D"
+$syncTriggers = @(
+    "03:50",
+    "07:50",
+    "11:50",
+    "15:50",
+    "19:50",
+    "23:50"
+) | ForEach-Object {
+    New-ScheduledTaskTrigger -Daily -At $_
+}
+
 $digestTrigger = New-ScheduledTaskTrigger -Daily -At "08:00"
 
 $settings = New-ScheduledTaskSettingsSet `
@@ -41,7 +49,7 @@ $settings = New-ScheduledTaskSettingsSet `
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
 
-Register-ScheduledTask -TaskName "$TaskPrefix - Sync" -Action $syncAction -Trigger $syncTrigger `
+Register-ScheduledTask -TaskName "$TaskPrefix - Sync" -Action $syncAction -Trigger $syncTriggers `
     -Settings $settings -Principal $principal `
     -Description "Read-only classic Outlook synchronization and SoCLaaS classification every four hours." `
     -Force | Out-Null
@@ -53,4 +61,3 @@ Register-ScheduledTask -TaskName "$TaskPrefix - Digest" -Action $digestAction -T
 
 Write-Host "Registered native Windows tasks for $currentUser."
 Write-Host "They run only while that user is logged in."
-
