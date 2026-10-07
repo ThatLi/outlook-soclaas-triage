@@ -41,6 +41,8 @@ Edit `%APPDATA%\OutlookTriage\secrets.env`:
 
 ```dotenv
 SOCLAAS_API_KEY=your-api-key
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 SOCLAAS_BASE_URL=https://soclaas-api.comp.nus.edu.sg/v1
 EMAIL_TRIAGE_MODEL=
 OUTLOOK_PROFILE=
@@ -112,6 +114,47 @@ outlook-triage tasks reopen 12
 ```
 
 These commands update only the local SQLite database. Digest files are saved under `%LOCALAPPDATA%\OutlookTriage\reports`.
+
+## Telegram digest delivery
+
+Telegram delivery is optional. Digest generation always saves the local Markdown file first, and the normal `digest` command never sends it anywhere.
+
+1. In Telegram, use the verified **@BotFather**, run `/newbot`, and keep the returned token private.
+2. Open the new bot's private chat and send `/start`.
+3. Put the token in `%APPDATA%\OutlookTriage\secrets.env`:
+
+   ```dotenv
+   TELEGRAM_BOT_TOKEN=replace-with-real-token
+   ```
+
+4. Discover the private chat ID:
+
+   ```powershell
+   outlook-triage telegram-chats
+   ```
+
+5. Add the displayed numeric ID to the same secrets file:
+
+   ```dotenv
+   TELEGRAM_CHAT_ID=123456789
+   ```
+
+6. Send a harmless test, then send a real digest:
+
+   ```powershell
+   outlook-triage telegram-test
+   outlook-triage digest --telegram
+   ```
+
+Long digests are HTML-escaped and split into ordered Telegram messages. If delivery fails, the saved Markdown report remains available locally and the command exits with an error. The bot token, Telegram response bodies, and digest contents are not written to application logs.
+
+To enable delivery for the 08:00 scheduled digest, register the tasks with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register_windows_tasks.ps1 -EnableTelegram
+```
+
+Telegram receives summaries, task descriptions, sender information, and deadlines. Do not enable this feature unless sending that information to Telegram is permitted by your organization.
 
 ## 6. Register native Windows schedules
 

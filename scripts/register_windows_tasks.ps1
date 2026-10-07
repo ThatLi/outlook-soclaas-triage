@@ -2,7 +2,8 @@
 param(
     [string]$ProjectDir = (Split-Path -Parent $PSScriptRoot),
     [string]$TaskPrefix = "Outlook SoCLaaS Triage",
-    [switch]$ReplaceLegacyWslTasks
+    [switch]$ReplaceLegacyWslTasks,
+    [switch]$EnableTelegram
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,7 +27,8 @@ foreach ($taskName in $taskNames) {
 }
 
 $syncAction = New-ScheduledTaskAction -Execute $executable -Argument "sync" -WorkingDirectory $project
-$digestAction = New-ScheduledTaskAction -Execute $executable -Argument "digest" -WorkingDirectory $project
+$digestArguments = if ($EnableTelegram) { "digest --telegram" } else { "digest" }
+$digestAction = New-ScheduledTaskAction -Execute $executable -Argument $digestArguments -WorkingDirectory $project
 
 $syncTriggers = @(
     "03:50",
@@ -56,7 +58,7 @@ Register-ScheduledTask -TaskName "$TaskPrefix - Sync" -Action $syncAction -Trigg
 
 Register-ScheduledTask -TaskName "$TaskPrefix - Digest" -Action $digestAction -Trigger $digestTrigger `
     -Settings $settings -Principal $principal `
-    -Description "Generate the local Outlook triage digest daily at 08:00." `
+    -Description $(if ($EnableTelegram) { "Generate the local Outlook triage digest and deliver it to Telegram daily at 08:00." } else { "Generate the local Outlook triage digest daily at 08:00." }) `
     -Force | Out-Null
 
 Write-Host "Registered native Windows tasks for $currentUser."

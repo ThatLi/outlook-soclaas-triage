@@ -30,8 +30,10 @@ test ! -e "$fake_home/.local/state/outlook-triage"
 
 archive="$(find "$fake_home/outlook-triage-rollback-backups" -name '*.tar.gz' -type f)"
 test -n "$archive"
-tar -tzf "$archive" | grep -q 'outlook-triage/src/app.py'
-if tar -tzf "$archive" | grep -q 'outlook-triage/.venv'; then
+archive_listing="$fake_home/archive-contents.txt"
+tar -tzf "$archive" > "$archive_listing"
+grep -q 'outlook-triage/src/app.py' "$archive_listing"
+if grep -q 'outlook-triage/.venv' "$archive_listing"; then
   exit 1
 fi
 (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$archive").sha256")

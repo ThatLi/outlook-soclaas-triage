@@ -41,6 +41,18 @@ class Settings:
     reports_dir: Path
     log_file: Path
     lock_dir: Path
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    telegram_timeout_seconds: float = 20.0
+
+    def require_telegram(self, *, require_chat: bool = True) -> None:
+        missing: list[str] = []
+        if not self.telegram_bot_token:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if require_chat and not self.telegram_chat_id:
+            missing.append("TELEGRAM_CHAT_ID")
+        if missing:
+            raise ConfigurationError(f"Missing Telegram configuration: {', '.join(missing)}")
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -79,6 +91,9 @@ def load_settings() -> Settings:
 
     return Settings(
         soclaas_api_key=value("SOCLAAS_API_KEY"),
+        telegram_bot_token=value("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=value("TELEGRAM_CHAT_ID"),
+        telegram_timeout_seconds=float(value("TELEGRAM_TIMEOUT_SECONDS", "20") or 20),
         soclaas_base_url=(value("SOCLAAS_BASE_URL", "https://soclaas-api.comp.nus.edu.sg/v1") or "").rstrip("/"),
         model=value("EMAIL_TRIAGE_MODEL"),
         timezone_name=timezone_name,

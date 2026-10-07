@@ -17,6 +17,7 @@ from .models import EmailForClassification
 from .outlook import OutlookClient
 from .service import retry_failed, synchronize
 from .soclaas import SoCLaaSClient
+from .telegram import TelegramClient
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("done", "waiting", "dismiss", "reopen"):
         action_parser = task_commands.add_parser(action)
         action_parser.add_argument("task_id", type=int)
+    commands.choices["digest"].add_argument(
+        "--telegram",
+        action="store_true",
+        help="Send the saved digest to the configured private Telegram chat",
+    )
+    commands.add_parser("telegram-chats", help="List recent private chats after messaging the bot")
+    commands.add_parser("telegram-test", help="Send a harmless test message to the configured private chat")
     return parser
 
 
@@ -64,6 +72,9 @@ def initialize(settings: Settings) -> None:
     ensure_runtime_directories(settings)
     secrets = """# Keep this file private.
 SOCLAAS_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_TIMEOUT_SECONDS=20
 SOCLAAS_BASE_URL=https://soclaas-api.comp.nus.edu.sg/v1
 EMAIL_TRIAGE_MODEL=
 OUTLOOK_PROFILE=
@@ -124,6 +135,30 @@ def run(args: argparse.Namespace) -> int:
         initialize(settings)
         return 0
 
+    if args.command == "telegram-chats":
+        settings.require_telegram(require_chat=False)
+        telegram = TelegramClient(
+            settings.telegram_bot_token or "",
+            timeout=settings.telegram_timeout_seconds,
+        )
+        chats = telegram.recent_private_chats()
+        if not chats:
+            print("No recent private chats found. Open the bot in Telegram, send /start, and try again.")
+            return 1
+        for chat in chats:
+            print(f"{chat.chat_id}\t{chat.display_name}")
+        return 0
+
+    if args.command == "telegram-test":
+        settings.require_telegram()
+        TelegramClient(
+            settings.telegram_bot_token or "",
+            settings.telegram_chat_id,
+            timeout=settings.telegram_timeout_seconds,
+        ).send_message("Outlook Triage Telegram delivery is configured successfully.")
+        print("Telegram test message sent.")
+        return 0
+
     if args.command == "models":
         ai = SoCLaaSClient(settings)
         models = ai.list_models()
@@ -172,6 +207,14 @@ def run(args: argparse.Namespace) -> int:
             now = datetime.now(settings.timezone)
             text = build_digest(db, settings, now)
             target = save_digest(text, settings.reports_dir, now.date())
+            if args.telegram:
+                settings.require_telegram()
+                delivered = TelegramClient(
+                    settings.telegram_bot_token or "",
+                    settings.telegram_chat_id,
+                    timeout=settings.telegram_timeout_seconds,
+                ).send_digest(text)
+                print(f"Telegram delivery complete: {delivered} message(s).")
             print(text)
             print(f"Saved: {target}")
             return 0
