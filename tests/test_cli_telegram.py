@@ -47,3 +47,10 @@ def test_scheduler_supports_opt_in_telegram_action():
     script = (cli.Path(__file__).parents[1] / "scripts" / "register_windows_tasks.ps1").read_text(encoding="utf-8")
     assert "[switch]$EnableTelegram" in script
     assert '"digest --telegram"' in script
+
+
+def test_scheduler_resolves_default_project_dir_inside_script_body():
+    script = (cli.Path(__file__).parents[1] / "scripts" / "register_windows_tasks.ps1").read_text(encoding="utf-8")
+    assert "[string]$ProjectDir =" not in script
+    assert "$scriptPath = $PSCommandPath" in script
+    assert "$scriptPath = $MyInvocation.MyCommand.Path" in script

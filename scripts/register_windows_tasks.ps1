@@ -1,12 +1,25 @@
 [CmdletBinding()]
 param(
-    [string]$ProjectDir = (Split-Path -Parent $PSScriptRoot),
+    [string]$ProjectDir,
     [string]$TaskPrefix = "Outlook SoCLaaS Triage",
     [switch]$ReplaceLegacyWslTasks,
     [switch]$EnableTelegram
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
+    $scriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        $scriptPath = $MyInvocation.MyCommand.Path
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        throw "Unable to determine the scheduler script location. Re-run with -ProjectDir <project-path>."
+    }
+    $scriptDirectory = Split-Path -Parent $scriptPath
+    $ProjectDir = Split-Path -Parent $scriptDirectory
+}
+
 $project = (Resolve-Path -LiteralPath $ProjectDir).Path
 $executable = Join-Path $project ".venv\Scripts\outlook-triage.exe"
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
