@@ -25,9 +25,6 @@ if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
 
 $project = (Resolve-Path -LiteralPath $ProjectDir).Path
 $executable = Join-Path $project ".venv\Scripts\outlook-triage.exe"
-if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
-    throw "The Windows virtual environment is missing: $executable"
-}
 
 $syncTimes = @("03:50", "07:50", "11:50", "15:50", "19:50", "23:50")
 $digestArguments = if ($EnableTelegram) { "digest --telegram" } else { "digest" }
@@ -74,6 +71,10 @@ $plan = [ordered]@{
 if ($ShowPlan) {
     $plan | ConvertTo-Json -Depth 6
     return
+}
+
+if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+    throw "The Windows virtual environment is missing: $executable"
 }
 
 $taskNames = @($plan.tasks | ForEach-Object { $_.name })

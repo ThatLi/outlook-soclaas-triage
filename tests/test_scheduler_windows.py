@@ -86,6 +86,44 @@ def test_scheduler_plan_resolves_default_project_directory():
     assert Path(plan["executable"]) == (PROJECT_ROOT / ".venv" / "Scripts" / "outlook-triage.exe").resolve()
 
 
+def test_scheduler_plan_does_not_require_installed_executable(tmp_path):
+    project = tmp_path / "project-without-venv"
+    project.mkdir()
+
+    plan = _show_plan("-ProjectDir", str(project))
+
+    assert Path(plan["projectDir"]) == project.resolve()
+    assert Path(plan["executable"]) == (project / ".venv" / "Scripts" / "outlook-triage.exe").resolve()
+
+
+def test_scheduler_registration_requires_installed_executable_before_task_access(tmp_path):
+    project = tmp_path / "project-without-venv"
+    project.mkdir()
+
+    completed = subprocess.run(
+        [
+            WINDOWS_POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SCRIPT),
+            "-ProjectDir",
+            str(project),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert "The Windows virtual environment is missing" in completed.stderr
+    compact_stderr = "".join(line.strip() for line in completed.stderr.splitlines())
+    assert str(project / ".venv" / "Scripts" / "outlook-triage.exe") in compact_stderr
+    assert "Get-ScheduledTask" not in completed.stderr
+
+
 def test_scheduler_never_starts_a_task_immediately():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "Start-ScheduledTask" not in source
