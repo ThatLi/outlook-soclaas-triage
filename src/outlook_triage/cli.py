@@ -17,7 +17,7 @@ from .models import EmailForClassification
 from .outlook import OutlookClient
 from .service import retry_failed, synchronize
 from .soclaas import SoCLaaSClient
-from .telegram import TelegramClient
+from .telegram import TelegramClient, TelegramError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -209,11 +209,15 @@ def run(args: argparse.Namespace) -> int:
             target = save_digest(text, settings.reports_dir, now.date())
             if args.telegram:
                 settings.require_telegram()
-                delivered = TelegramClient(
-                    settings.telegram_bot_token or "",
-                    settings.telegram_chat_id,
-                    timeout=settings.telegram_timeout_seconds,
-                ).send_digest(text)
+                try:
+                    delivered = TelegramClient(
+                        settings.telegram_bot_token or "",
+                        settings.telegram_chat_id,
+                        timeout=settings.telegram_timeout_seconds,
+                    ).send_digest(text)
+                except TelegramError as exc:
+                    logger.error("Telegram digest delivery failed: %s", exc)
+                    raise
                 print(f"Telegram delivery complete: {delivered} message(s).")
             print(text)
             print(f"Saved: {target}")

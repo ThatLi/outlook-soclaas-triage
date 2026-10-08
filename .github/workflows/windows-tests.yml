@@ -1,0 +1,85 @@
+name: Windows tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-tests:
+    name: Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install application and test dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Check installed dependencies
+        shell: powershell
+        run: python -m pip check
+
+      - name: Run Windows test suite
+        shell: powershell
+        run: |
+          python -m pytest `
+            --ignore=tests/test_rollback_wsl.py `
+            --basetemp="${{ runner.temp }}\pytest-windows" `
+            -p no:cacheprovider
+
+      - name: Parse scheduler with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          $script = (Resolve-Path "scripts\register_windows_tasks.ps1").Path
+
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $script,
+              [ref]$tokens,
+              [ref]$errors
+          )
+
+          if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+          }
+
+      - name: Parse scheduler with PowerShell 7
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $script = (Resolve-Path "scripts/register_windows_tasks.ps1").Path
+
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $script,
+              [ref]$tokens,
+              [ref]$errors
+          )
+
+          if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+          }

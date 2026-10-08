@@ -10,6 +10,7 @@ from outlook_triage.database import Database
 from outlook_triage.filters import FilterRules
 from outlook_triage.models import EmailClassification, EmailForClassification
 from outlook_triage.outlook import SyncResult
+from outlook_triage.outlook import OutlookUnavailable
 from outlook_triage.service import synchronize
 from outlook_triage.soclaas import SoCLaaSClient, SoCLaaSError
 
@@ -99,6 +100,33 @@ def test_sync_keeps_failed_message_for_retry(settings):
         assert counts["failed"] == 1
         assert db.pending_messages()[0]["source_id"] == "entry-1"
         assert db.get_last_received_at() == "2026-09-28T09:00:00+08:00"
+    finally:
+        db.close()
+
+
+def test_outlook_failure_does_not_advance_high_water_timestamp(settings):
+    previous_high_water = "2026-09-27T09:00:00+08:00"
+
+    class UnavailableOutlook:
+        def sync(self, last_received_at, *, bootstrap_days, overlap_hours):
+            assert last_received_at == previous_high_water
+            raise OutlookUnavailable("Outlook temporarily unavailable")
+
+    db = Database(settings.database_file)
+    db.store_sync_batch([], previous_high_water)
+    try:
+        with pytest.raises(OutlookUnavailable, match="temporarily unavailable"):
+            synchronize(
+                db=db,
+                outlook=UnavailableOutlook(),
+                ai=FakeAI(),
+                rules=FilterRules(),
+                settings=settings,
+                logger=logging.getLogger("test"),
+            )
+        assert db.get_last_received_at() == previous_high_water
+        snapshot = db.digest_snapshot("2000-01-01T00:00:00+00:00")
+        assert snapshot["last_run"]["status"] == "failed"
     finally:
         db.close()
 

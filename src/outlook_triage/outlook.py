@@ -172,7 +172,10 @@ class OutlookClient:
     def newest_messages(self, limit: int = 10) -> list[dict]:
         messages: list[dict] = []
         for item in self._iter_sorted():
-            normalized = self._normalize(item, include_body=False)
+            try:
+                normalized = self._normalize(item, include_body=False)
+            except (OutlookError, TypeError, ValueError):
+                continue
             if normalized:
                 messages.append(normalized)
                 if len(messages) >= limit:
@@ -208,7 +211,10 @@ class OutlookClient:
                 continue
             if received < cutoff:
                 break
-            normalized = self._normalize(item, include_body=True)
+            try:
+                normalized = self._normalize(item, include_body=True)
+            except (OutlookError, TypeError, ValueError):
+                continue
             if not normalized:
                 continue
             messages.append(normalized)
