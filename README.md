@@ -154,6 +154,12 @@ To enable delivery for the 08:00 scheduled digest, register the tasks with:
 powershell -ExecutionPolicy Bypass -File scripts\register_windows_tasks.ps1 -EnableTelegram
 ```
 
+Preview the complete task definitions without reading or changing Task Scheduler:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register_windows_tasks.ps1 -EnableTelegram -ShowPlan
+```
+
 Telegram receives summaries, task descriptions, sender information, and deadlines. Do not enable this feature unless sending that information to Telegram is permitted by your organization.
 
 ## 6. Register native Windows schedules

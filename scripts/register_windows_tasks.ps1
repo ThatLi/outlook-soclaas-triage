@@ -3,7 +3,8 @@ param(
     [string]$ProjectDir,
     [string]$TaskPrefix = "Outlook SoCLaaS Triage",
     [switch]$ReplaceLegacyWslTasks,
-    [switch]$EnableTelegram
+    [switch]$EnableTelegram,
+    [switch]$ShowPlan
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +27,53 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "The Windows virtual environment is missing: $executable"
 }
 
+$syncTimes = @("03:50", "07:50", "11:50", "15:50", "19:50", "23:50")
+$digestArguments = if ($EnableTelegram) { "digest --telegram" } else { "digest" }
+$syncDescription = "Read-only classic Outlook synchronization and SoCLaaS classification every four hours."
+$digestDescription = if ($EnableTelegram) {
+    "Generate the local Outlook triage digest and deliver it to Telegram daily at 08:00."
+} else {
+    "Generate the local Outlook triage digest daily at 08:00."
+}
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+$plan = [ordered]@{
+    projectDir = $project
+    executable = $executable
+    telegramEnabled = [bool]$EnableTelegram
+    settings = [ordered]@{
+        startWhenAvailable = $true
+        multipleInstances = "IgnoreNew"
+        executionTimeLimit = "PT2H"
+    }
+    principal = [ordered]@{
+        userId = $currentUser
+        logonType = "Interactive"
+        runLevel = "Limited"
+    }
+    tasks = @(
+        [ordered]@{
+            name = "$TaskPrefix - Sync"
+            arguments = "sync"
+            workingDirectory = $project
+            triggerTimes = $syncTimes
+            description = $syncDescription
+        },
+        [ordered]@{
+            name = "$TaskPrefix - Digest"
+            arguments = $digestArguments
+            workingDirectory = $project
+            triggerTimes = @("08:00")
+            description = $digestDescription
+        }
+    )
+}
+
+if ($ShowPlan) {
+    $plan | ConvertTo-Json -Depth 6
+    return
+}
+
 $taskNames = @("$TaskPrefix - Sync", "$TaskPrefix - Digest")
 foreach ($taskName in $taskNames) {
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -40,17 +88,9 @@ foreach ($taskName in $taskNames) {
 }
 
 $syncAction = New-ScheduledTaskAction -Execute $executable -Argument "sync" -WorkingDirectory $project
-$digestArguments = if ($EnableTelegram) { "digest --telegram" } else { "digest" }
 $digestAction = New-ScheduledTaskAction -Execute $executable -Argument $digestArguments -WorkingDirectory $project
 
-$syncTriggers = @(
-    "03:50",
-    "07:50",
-    "11:50",
-    "15:50",
-    "19:50",
-    "23:50"
-) | ForEach-Object {
+$syncTriggers = $syncTimes | ForEach-Object {
     New-ScheduledTaskTrigger -Daily -At $_
 }
 
@@ -61,17 +101,16 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 2)
 
-$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask -TaskName "$TaskPrefix - Sync" -Action $syncAction -Trigger $syncTriggers `
     -Settings $settings -Principal $principal `
-    -Description "Read-only classic Outlook synchronization and SoCLaaS classification every four hours." `
+    -Description $syncDescription `
     -Force | Out-Null
 
 Register-ScheduledTask -TaskName "$TaskPrefix - Digest" -Action $digestAction -Trigger $digestTrigger `
     -Settings $settings -Principal $principal `
-    -Description $(if ($EnableTelegram) { "Generate the local Outlook triage digest and deliver it to Telegram daily at 08:00." } else { "Generate the local Outlook triage digest daily at 08:00." }) `
+    -Description $digestDescription `
     -Force | Out-Null
 
 Write-Host "Registered native Windows tasks for $currentUser."
