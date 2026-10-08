@@ -9,15 +9,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$scriptPath = $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+}
+if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+    throw "Unable to determine the scheduler script location. Re-run with -ProjectDir <project-path>."
+}
+$scriptDirectory = Split-Path -Parent $scriptPath
+Import-Module (Join-Path $scriptDirectory "OutlookTriage.Scheduler.psm1") -Force
+
 if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
-    $scriptPath = $PSCommandPath
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-        $scriptPath = $MyInvocation.MyCommand.Path
-    }
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-        throw "Unable to determine the scheduler script location. Re-run with -ProjectDir <project-path>."
-    }
-    $scriptDirectory = Split-Path -Parent $scriptPath
     $ProjectDir = Split-Path -Parent $scriptDirectory
 }
 
@@ -74,16 +76,15 @@ if ($ShowPlan) {
     return
 }
 
-$taskNames = @("$TaskPrefix - Sync", "$TaskPrefix - Digest")
+$taskNames = @($plan.tasks | ForEach-Object { $_.name })
 foreach ($taskName in $taskNames) {
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($existing) {
-        $usesWsl = @($existing.Actions | Where-Object {
-            $_.Execute -match '(^|\\)wsl(\.exe)?$'
-        }).Count -gt 0
-        if ($usesWsl -and -not $ReplaceLegacyWslTasks) {
-            throw "'$taskName' still invokes WSL. Re-run with -ReplaceLegacyWslTasks after reviewing the legacy task."
-        }
+    $existingExecutables = if ($existing) { @($existing.Actions | ForEach-Object { $_.Execute }) } else { @() }
+    $decision = Get-OutlookTriageReplacementDecision `
+        -ExistingActionExecutables $existingExecutables `
+        -ReplaceLegacyWslTasks:$ReplaceLegacyWslTasks
+    if (-not $decision.allowed) {
+        throw "'$taskName' still invokes WSL. Re-run with -ReplaceLegacyWslTasks after reviewing the legacy task."
     }
 }
 
