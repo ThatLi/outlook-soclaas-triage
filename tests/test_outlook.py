@@ -4,7 +4,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from outlook_triage.outlook import OutlookClient, OutlookSecurityError, message_key
+from outlook_triage.outlook import (
+    OutlookClient,
+    OutlookSecurityError,
+    OutlookUnavailable,
+    message_key,
+)
 
 
 SGT = ZoneInfo("Asia/Singapore")
@@ -134,4 +139,119 @@ def test_access_denied_is_reported_as_security_error():
 
     with pytest.raises(OutlookSecurityError, match="will not bypass"):
         OutlookClient(dispatch=denied, co_initialize=lambda: None, co_uninitialize=lambda: None)
+
+
+@pytest.mark.parametrize("failure_point", ["dispatch", "namespace", "profile", "inbox"])
+def test_constructor_failures_release_com_and_report_outlook_unavailable(failure_point):
+    lifecycle = []
+
+    class FailingNamespace:
+        def Logon(self, *args):
+            if failure_point == "profile":
+                raise RuntimeError("profile is invalid")
+
+        def GetDefaultFolder(self, folder_id):
+            if failure_point == "inbox":
+                raise RuntimeError("Inbox is unavailable")
+            return SimpleNamespace(StoreID="store-1", Items=Items([]))
+
+    class Application:
+        def GetNamespace(self, name):
+            if failure_point == "namespace":
+                raise RuntimeError("MAPI is unavailable")
+            return FailingNamespace()
+
+    def dispatch(prog_id):
+        if failure_point == "dispatch":
+            raise RuntimeError("classic Outlook is unavailable")
+        return Application()
+
+    with pytest.raises(OutlookUnavailable, match="classic Outlook"):
+        OutlookClient(
+            "Work",
+            dispatch=dispatch,
+            co_initialize=lambda: lifecycle.append("init"),
+            co_uninitialize=lambda: lifecycle.append("uninit"),
+        )
+    assert lifecycle == ["init", "uninit"]
+
+
+def test_com_busy_during_enumeration_is_translated_and_com_is_released():
+    client, namespace, lifecycle = make_client([])
+
+    class BusyItems:
+        def Sort(self, field, descending):
+            raise RuntimeError("Call was rejected by callee")
+
+    namespace.inbox.Items = BusyItems()
+    with pytest.raises(OutlookUnavailable, match="enumerate Inbox messages"):
+        with client:
+            client.newest_messages()
+    assert lifecycle == ["init", "uninit"]
+
+
+@pytest.mark.parametrize(
+    "failure, expected_error",
+    [
+        (KeyError("message disappeared"), OutlookUnavailable),
+        (RuntimeError("0x80070005 Access denied"), OutlookSecurityError),
+    ],
+)
+def test_get_item_failure_is_translated(failure, expected_error):
+    client, namespace, lifecycle = make_client([])
+
+    def fail_get_item(entry_id, store_id):
+        raise failure
+
+    namespace.GetItemFromID = fail_get_item
+    with pytest.raises(expected_error, match="selected Outlook message"):
+        with client:
+            client.get_message("missing-entry")
+    assert lifecycle == ["init", "uninit"]
+
+
+def test_exchange_sender_property_denial_falls_back_to_sender_email_address():
+    item = Item("entry-1", datetime(2026, 10, 2, 8, 0, tzinfo=SGT), sender_type="EX")
+
+    class DeniedSender:
+        def GetExchangeUser(self):
+            raise RuntimeError("property access denied")
+
+    item.Sender = DeniedSender()
+    client, _, _ = make_client([item])
+    with client:
+        message = client.get_message("entry-1")
+    assert message["sender"]["emailAddress"]["address"] == "alice@example.com"
+
+
+def test_close_is_idempotent_and_context_failure_releases_com():
+    client, _, lifecycle = make_client([])
+    with pytest.raises(RuntimeError, match="operation failed"):
+        with client:
+            raise RuntimeError("operation failed")
+    client.close()
+    client.close()
+    assert lifecycle == ["init", "uninit"]
+
+
+def test_malformed_items_are_skipped_during_inbox_enumeration():
+    missing_received = Item("missing-received", None)
+    invalid_importance = Item("bad-importance", datetime(2026, 10, 2, 9, 0, tzinfo=SGT))
+    invalid_importance.Importance = "not-an-integer"
+    valid = Item("valid", datetime(2026, 10, 2, 8, 0, tzinfo=SGT))
+    client, _, _ = make_client([missing_received, invalid_importance, valid])
+    with client:
+        newest = client.newest_messages()
+    assert [message["sourceId"] for message in newest] == ["valid"]
+
+
+def test_malformed_items_are_skipped_during_sync():
+    malformed = Item("bad", datetime(2026, 10, 2, 9, 0, tzinfo=SGT))
+    malformed.Importance = "not-an-integer"
+    valid = Item("valid", datetime(2026, 10, 2, 8, 0, tzinfo=SGT))
+    client, _, _ = make_client([malformed, valid])
+    with client:
+        result = client.sync("2026-10-02T07:00:00+08:00", overlap_hours=0)
+    assert [message["sourceId"] for message in result.messages] == ["valid"]
+    assert result.high_water_received_at == "2026-10-02T08:00:00+08:00"
 
