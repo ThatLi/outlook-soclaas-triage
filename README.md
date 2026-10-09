@@ -146,7 +146,17 @@ Telegram delivery is optional. Digest generation always saves the local Markdown
    outlook-triage digest --telegram
    ```
 
-Telegram delivery starts with a summary containing open-action counts, recent inbox activity, and synchronization status. Non-empty task sections follow as compact checklists, with related priorities grouped when they fit; other open actions are preferentially grouped with waiting/follow-up items. Long sections are HTML-escaped and split into ordered continuation messages. If delivery fails, the saved Markdown report remains available locally and the command exits with an error. The bot token, Telegram response bodies, and digest contents are not written to application logs.
+Telegram delivery starts with a summary containing open-action counts, recent inbox activity, and synchronization status. Non-empty task sections follow as compact checklists, with related priorities grouped when they fit; other open actions are preferentially grouped with waiting/follow-up items. Long sections are HTML-escaped and split into ordered continuation messages. If delivery fails, the saved Markdown report remains available locally. Transient failures return an error so Windows can retry; permanent failures pause the queue for intervention. The bot token, Telegram response bodies, and digest contents are not written to application logs.
+
+Formatted Telegram messages are frozen in a local SQLite outbox before the first send. Transient network, rate-limit, and Telegram server failures remain queued and the Telegram-enabled scheduled task retries them every 30 minutes. Confirmed chunks are not resent; a resumed digest begins with a delayed-delivery notice. Queued digests are delivered oldest-first and expire after seven days, while their Markdown reports remain available locally.
+
+Invalid credentials, a missing or blocked chat, and rejected formatting pause automatic delivery and show a Windows tray warning instead of repeatedly retrying. Correct the Telegram configuration or application issue, then reactivate and send the queue with:
+
+```powershell
+outlook-triage telegram-retry
+```
+
+Telegram does not provide a request idempotency key. If Telegram accepts a chunk but the network fails before acknowledging it, that one chunk may appear twice after recovery.
 
 To enable delivery for the 08:00 scheduled digest, register the tasks with:
 
@@ -154,13 +164,15 @@ To enable delivery for the 08:00 scheduled digest, register the tasks with:
 powershell -ExecutionPolicy Bypass -File scripts\register_windows_tasks.ps1 -EnableTelegram
 ```
 
+Re-run this registration command after upgrading an existing installation so the digest task receives the 30-minute transient-failure retry policy.
+
 Preview the complete task definitions without reading or changing Task Scheduler:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register_windows_tasks.ps1 -EnableTelegram -ShowPlan
 ```
 
-Telegram receives summaries, task descriptions, sender information, and deadlines. Do not enable this feature unless sending that information to Telegram is permitted by your organization.
+Telegram receives summaries, task descriptions, sender information, and deadlines. Pending Telegram chunks contain the same information and are retained in the local SQLite database for up to seven days. Do not enable this feature unless sending that information to Telegram is permitted by your organization.
 
 ## 6. Register native Windows schedules
 
@@ -173,7 +185,7 @@ Only schedule the application after the manual checks and two consecutive synchr
 It registers interactive tasks for the current Windows user:
 
 - Synchronization at 03:50, then every four hours through 23:50.
-- Digest generation daily at 08:00.
+- Digest generation daily at 08:00, with 30-minute retries after transient Telegram failures when enabled.
 - Start-after-missed-run behavior and overlapping-run prevention.
 
 If legacy tasks still invoke WSL, the script refuses to overwrite them. Inspect them first:

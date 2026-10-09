@@ -132,18 +132,31 @@ def test_telegram_chats_requires_token_but_not_chat_id(monkeypatch, settings, ca
     assert "42\tPrivate user" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["telegram-test", "digest"])
-def test_telegram_delivery_commands_require_token_and_chat_id(monkeypatch, settings, command):
+def test_telegram_test_requires_token_and_chat_id(monkeypatch, settings):
     unconfigured = replace(settings, telegram_bot_token="token", telegram_chat_id=None)
     monkeypatch.setattr(cli, "load_settings", lambda: unconfigured)
-    monkeypatch.setattr(cli, "build_digest", lambda *args: "# Saved before validation")
     monkeypatch.setattr(cli, "TelegramClient", lambda *args, **kwargs: pytest.fail("client was constructed"))
-    args = Namespace(command=command, verbose=False, telegram=True) if command == "digest" else Namespace(command=command, verbose=False)
-
     with pytest.raises(ConfigurationError, match="TELEGRAM_CHAT_ID"):
-        cli.run(args)
+        cli.run(Namespace(command="telegram-test", verbose=False))
 
-    if command == "digest":
-        reports = list(unconfigured.reports_dir.glob("*.md"))
-        assert len(reports) == 1
-        assert reports[0].read_text(encoding="utf-8") == "# Saved before validation"
+
+def test_digest_queues_before_missing_telegram_configuration_is_handled(monkeypatch, settings):
+    unconfigured = replace(settings, telegram_bot_token="token", telegram_chat_id=None)
+    monkeypatch.setattr(cli, "load_settings", lambda: unconfigured)
+    monkeypatch.setattr(cli, "build_digest", lambda *args: "# Saved before delivery")
+    monkeypatch.setattr(
+        cli,
+        "deliver_pending",
+        lambda *args, **kwargs: type("Result", (), {
+            "completed_deliveries": 0,
+            "delivered_messages": 0,
+            "needs_attention": 1,
+            "expired": 0,
+        })(),
+    )
+
+    assert cli.run(Namespace(command="digest", verbose=False, telegram=True)) == 0
+
+    reports = list(unconfigured.reports_dir.glob("*.md"))
+    assert len(reports) == 1
+    assert reports[0].read_text(encoding="utf-8") == "# Saved before delivery"

@@ -67,6 +67,8 @@ $plan = [ordered]@{
             workingDirectory = $project
             triggerTimes = @("08:00")
             description = $digestDescription
+            restartCount = $(if ($EnableTelegram) { 47 } else { 0 })
+            restartInterval = $(if ($EnableTelegram) { "PT30M" } else { $null })
         }
     )
 }
@@ -101,22 +103,40 @@ $syncTriggers = $syncTimes | ForEach-Object {
 
 $digestTrigger = New-ScheduledTaskTrigger -Daily -At "08:00"
 
-$settings = New-ScheduledTaskSettingsSet `
+$syncSettings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 2)
 
+$digestSettings = if ($EnableTelegram) {
+    New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+        -RestartCount 47 `
+        -RestartInterval (New-TimeSpan -Minutes 30)
+} else {
+    New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+}
+
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask -TaskName "$TaskPrefix - Sync" -Action $syncAction -Trigger $syncTriggers `
-    -Settings $settings -Principal $principal `
+    -Settings $syncSettings -Principal $principal `
     -Description $syncDescription `
     -Force | Out-Null
 
 Register-ScheduledTask -TaskName "$TaskPrefix - Digest" -Action $digestAction -Trigger $digestTrigger `
-    -Settings $settings -Principal $principal `
+    -Settings $digestSettings -Principal $principal `
     -Description $digestDescription `
     -Force | Out-Null
 
