@@ -55,6 +55,9 @@ def test_scheduler_plan_contains_complete_windows_task_definition(tmp_path):
     assert plan["telegramEnabled"] is False
     assert plan["settings"] == {
         "startWhenAvailable": True,
+        "allowStartOnBatteries": True,
+        "stopIfGoingOnBatteries": False,
+        "wakeToRun": False,
         "multipleInstances": "IgnoreNew",
         "executionTimeLimit": "PT2H",
     }
@@ -127,6 +130,21 @@ def test_scheduler_registration_requires_installed_executable_before_task_access
 def test_scheduler_never_starts_a_task_immediately():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "Start-ScheduledTask" not in source
+
+
+def test_scheduler_uses_timed_catch_up_without_startup_or_logon_triggers():
+    source = SCRIPT.read_text(encoding="utf-8")
+    plan = _show_plan("-EnableTelegram")
+
+    assert plan["settings"]["startWhenAvailable"] is True
+    assert plan["settings"]["allowStartOnBatteries"] is True
+    assert plan["settings"]["stopIfGoingOnBatteries"] is False
+    assert plan["settings"]["wakeToRun"] is False
+    assert plan["tasks"][1]["triggerTimes"] == ["08:00"]
+    assert plan["tasks"][1]["arguments"] == "digest --telegram"
+    assert "-AtStartup" not in source
+    assert "-AtLogOn" not in source
+    assert "-WakeToRun" not in source
 
 
 def _replacement_decision(actions: list[str], *, replace: bool = False) -> dict:

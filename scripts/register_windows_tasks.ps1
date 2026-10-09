@@ -42,6 +42,9 @@ $plan = [ordered]@{
     telegramEnabled = [bool]$EnableTelegram
     settings = [ordered]@{
         startWhenAvailable = $true
+        allowStartOnBatteries = $true
+        stopIfGoingOnBatteries = $false
+        wakeToRun = $false
         multipleInstances = "IgnoreNew"
         executionTimeLimit = "PT2H"
     }
@@ -100,6 +103,8 @@ $digestTrigger = New-ScheduledTaskTrigger -Daily -At "08:00"
 
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 2)
 
