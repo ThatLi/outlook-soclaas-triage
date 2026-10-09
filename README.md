@@ -146,7 +146,7 @@ Telegram delivery is optional. Digest generation always saves the local Markdown
    outlook-triage digest --telegram
    ```
 
-Long digests are HTML-escaped and split into ordered Telegram messages. If delivery fails, the saved Markdown report remains available locally and the command exits with an error. The bot token, Telegram response bodies, and digest contents are not written to application logs.
+Telegram delivery starts with a summary containing open-action counts, recent inbox activity, and synchronization status. Non-empty task sections follow as compact checklists, with related priorities grouped when they fit; other open actions are preferentially grouped with waiting/follow-up items. Long sections are HTML-escaped and split into ordered continuation messages. If delivery fails, the saved Markdown report remains available locally and the command exits with an error. The bot token, Telegram response bodies, and digest contents are not written to application logs.
 
 To enable delivery for the 08:00 scheduled digest, register the tasks with:
 

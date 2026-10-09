@@ -31,6 +31,38 @@ class Session:
         return response
 
 
+def _outlook_digest(*, overdue=None, urgent=None, upcoming=None, other=None, waiting=None):
+    sections = (
+        ("Overdue", overdue or []),
+        ("Urgent / due today", urgent or []),
+        ("Due within 7 days", upcoming or []),
+        ("Other open actions", other or []),
+        ("Waiting / follow-up", waiting or []),
+    )
+    lines = [
+        "# Inbox brief — 2026-10-09",
+        "",
+        "Last successful Outlook sync: 2026-10-09T07:58:00+08:00",
+        "",
+        "> **Warning:** Some messages are pending or failed classification. Run `outlook-triage retry-failed`.",
+    ]
+    for heading, tasks in sections:
+        lines.extend(["", f"## {heading}"])
+        lines.extend(tasks or ["- None"])
+    lines.extend(
+        [
+            "",
+            "## Last 24 hours",
+            "- Informational: 12",
+            "- Newsletters: 4",
+            "- Automated: 2",
+            "- Explicitly skipped: 0",
+            "- Pending or failed: 2",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def test_format_digest_escapes_and_formats():
     chunks = format_digest("# Digest <today>\n\n## Urgent\n\n- Reply to A & B `today`")
     assert chunks == ["<b>Digest &lt;today&gt;</b>\n\n<b>Urgent</b>\n\n• Reply to A &amp; B today"]
@@ -44,6 +76,63 @@ def test_format_digest_chunks_long_unicode_content():
 
 def test_empty_digest_has_safe_fallback():
     assert "No digest content" in format_digest("")[0]
+
+
+def test_outlook_digest_uses_summary_and_priority_messages():
+    markdown = _outlook_digest(
+        overdue=["- [#42] Submit <expense> report — due 2026-10-08 (Finance & Ops)"],
+        urgent=["- [#51] Confirm deployment window — due 2026-10-09 (Engineering)"],
+        upcoming=["- [#56] Review Q4 forecast — due 2026-10-11 (Finance)"],
+        other=["- [#68] Review architecture proposal (Engineering)"],
+        waiting=["- [#33] Vendor security questionnaire (Acme)"],
+    )
+
+    chunks = format_digest(markdown)
+
+    assert len(chunks) == 3
+    summary, immediate, rare = chunks
+    assert summary.startswith("📬 <b>INBOX BRIEF · 9 OCT 2026</b>")
+    assert "<b>OPEN ACTIONS</b>\n\n🔴 Overdue: <b>1</b>" in summary
+    assert "\n\n📊 <b>LAST 24 HOURS</b>\n\n• Informational: <b>12</b>" in summary
+    assert "\n\n🔄 <b>SYNCHRONIZATION</b>\n\n✅ Last successful sync: <b>09 Oct, 07:58</b>" in summary
+    assert "⚠️ Some messages are pending or failed classification." in summary
+
+    assert "🔴 <b>OVERDUE · 1</b>\n\n☐ <code>#42</code> Submit &lt;expense&gt; report" in immediate
+    assert "Due <b>8 Oct</b> · Finance &amp; Ops" in immediate
+    assert "\n\n🟠 <b>URGENT / DUE TODAY · 1</b>\n\n" in immediate
+    assert "Due <b>today</b> · Engineering" in immediate
+    assert "\n\n🟡 <b>DUE WITHIN 7 DAYS · 1</b>\n\n" in immediate
+
+    assert "DUE WITHIN" not in rare
+    assert "⚪ <b>OTHER OPEN ACTIONS · 1</b>\n\n" in rare
+    assert "\n\n💤 <b>WAITING / FOLLOW-UP · 1</b>\n\n" in rare
+
+
+def test_outlook_digest_omits_empty_priority_sections():
+    chunks = format_digest(_outlook_digest(urgent=["- [#1] Act now (Alice)"]))
+
+    assert len(chunks) == 2
+    assert "Overdue: <b>0</b>" in chunks[0]
+    assert "Other open actions: <b>0</b>" in chunks[0]
+    assert "OVERDUE ·" not in chunks[1]
+    assert "OTHER OPEN ACTIONS ·" not in chunks[1]
+    assert "URGENT / DUE TODAY · 1" in chunks[1]
+
+
+def test_outlook_digest_splits_large_section_with_repeated_headings():
+    tasks = [
+        f"- [#{index}] Review item {index} with supporting context " + ("detail " * 12) + "(Operations)"
+        for index in range(1, 81)
+    ]
+    chunks = format_digest(_outlook_digest(overdue=tasks))
+
+    priority_chunks = chunks[1:]
+    assert len(priority_chunks) > 1
+    assert all("🔴 <b>OVERDUE · 80</b> — PART " in chunk for chunk in priority_chunks)
+    assert all(len(chunk) < 4096 for chunk in priority_chunks)
+    joined = "\n".join(priority_chunks)
+    for index in range(1, 81):
+        assert joined.count(f"<code>#{index}</code>") == 1
 
 
 def test_recent_private_chats_deduplicates_and_ignores_groups():
