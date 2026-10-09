@@ -14,6 +14,11 @@ import requests
 class TelegramError(RuntimeError):
     """A sanitized Telegram delivery error safe to show or log."""
 
+    def __init__(self, message: str, *, category: str = "permanent", status_code: int | None = None):
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+
 
 @dataclass(frozen=True)
 class TelegramChat:
@@ -376,7 +381,7 @@ class TelegramClient:
         sleep: Callable[[float], None] = time.sleep,
     ):
         if not token:
-            raise TelegramError("TELEGRAM_BOT_TOKEN is not configured")
+            raise TelegramError("TELEGRAM_BOT_TOKEN is not configured", category="configuration")
         self._token = token
         self.chat_id = chat_id
         self.timeout = timeout
@@ -387,17 +392,27 @@ class TelegramClient:
         return f"https://api.telegram.org/bot{self._token}/{method}"
 
     @staticmethod
-    def _description(payload: Any, fallback: str) -> str:
+    def _rejection(response_status: int, payload: Any) -> TelegramError:
+        fallback = f"Telegram rejected the request (HTTP {response_status})"
         if not isinstance(payload, dict):
-            return fallback
+            return TelegramError(fallback, category="content", status_code=response_status)
         description = str(payload.get("description") or fallback).lower()
         if "token" in description or "unauthorized" in description:
-            return "Telegram rejected the bot credentials"
+            return TelegramError(
+                "Telegram rejected the bot credentials", category="credentials", status_code=response_status
+            )
         if "chat not found" in description:
-            return "Telegram could not find the configured private chat"
+            return TelegramError(
+                "Telegram could not find the configured private chat", category="chat", status_code=response_status
+            )
         if "bot was blocked" in description or "forbidden" in description:
-            return "Telegram delivery is forbidden or the bot was blocked"
-        return fallback
+            return TelegramError(
+                "Telegram delivery is forbidden or the bot was blocked",
+                category="access",
+                status_code=response_status,
+            )
+        category = "credentials" if response_status == 401 else "access" if response_status == 403 else "content"
+        return TelegramError(fallback, category=category, status_code=response_status)
 
     def _request(self, method: str, data: dict[str, Any] | None = None) -> Any:
         for attempt in range(5):
@@ -405,7 +420,7 @@ class TelegramClient:
                 response = self.session.post(self._url(method), data=data or {}, timeout=self.timeout)
             except requests.RequestException as exc:
                 if attempt == 4:
-                    raise TelegramError("Telegram was unreachable after retries") from exc
+                    raise TelegramError("Telegram was unreachable after retries", category="transient") from exc
                 self.sleep(min(30.0, 2**attempt) + random.uniform(0, 0.5))
                 continue
             try:
@@ -414,10 +429,10 @@ class TelegramClient:
                 if response.status_code >= 500 and attempt < 4:
                     self.sleep(min(30.0, 2**attempt) + random.uniform(0, 0.5))
                     continue
-                raise TelegramError("Telegram returned an invalid response") from exc
+                raise TelegramError("Telegram returned an invalid response", category="transient") from exc
             if response.status_code == 429:
                 if attempt == 4:
-                    raise TelegramError("Telegram rate limiting persisted after retries")
+                    raise TelegramError("Telegram rate limiting persisted after retries", category="transient")
                 parameters = payload.get("parameters", {}) if isinstance(payload, dict) else {}
                 retry_after = parameters.get("retry_after", 2**attempt)
                 try:
@@ -428,11 +443,13 @@ class TelegramClient:
                 continue
             if response.status_code >= 500:
                 if attempt == 4:
-                    raise TelegramError("Telegram server error persisted after retries")
+                    raise TelegramError("Telegram server error persisted after retries", category="transient")
                 self.sleep(min(30.0, 2**attempt) + random.uniform(0, 0.5))
                 continue
-            if response.status_code in {400, 401, 403} or not isinstance(payload, dict) or not payload.get("ok"):
-                raise TelegramError(self._description(payload, f"Telegram rejected the request (HTTP {response.status_code})"))
+            if not isinstance(payload, dict):
+                raise TelegramError("Telegram returned an invalid response", category="transient")
+            if response.status_code in {400, 401, 403} or not payload.get("ok"):
+                raise self._rejection(response.status_code, payload)
             return payload.get("result")
         raise AssertionError("unreachable")
 
@@ -451,16 +468,21 @@ class TelegramClient:
             chats[chat_id] = TelegramChat(chat_id, name, "private")
         return list(chats.values())
 
-    def send_message(self, text: str, *, chat_id: str | None = None) -> None:
+    def send_message(self, text: str, *, chat_id: str | None = None, parse_mode: str | None = "HTML") -> None:
         target = chat_id or self.chat_id
         if not target:
-            raise TelegramError("TELEGRAM_CHAT_ID is not configured")
-        self._request("sendMessage", {
+            raise TelegramError("TELEGRAM_CHAT_ID is not configured", category="configuration")
+        data = {
             "chat_id": target,
             "text": text,
-            "parse_mode": "HTML",
             "disable_web_page_preview": "true",
-        })
+        }
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        self._request("sendMessage", data)
+
+    def send_plain_message(self, text: str, *, chat_id: str | None = None) -> None:
+        self.send_message(text, chat_id=chat_id, parse_mode=None)
 
     def send_digest(self, markdown: str) -> int:
         chunks = format_digest(markdown)
@@ -468,5 +490,9 @@ class TelegramClient:
             try:
                 self.send_message(chunk)
             except TelegramError as exc:
-                raise TelegramError(f"Telegram digest delivery failed at message {index} of {len(chunks)}: {exc}") from exc
+                raise TelegramError(
+                    f"Telegram digest delivery failed at message {index} of {len(chunks)}: {exc}",
+                    category=exc.category,
+                    status_code=exc.status_code,
+                ) from exc
         return len(chunks)

@@ -9,6 +9,7 @@ import pytest
 import requests
 
 from outlook_triage import cli
+from outlook_triage import telegram_delivery
 from outlook_triage.database import Database
 from outlook_triage.filters import FilterRules
 from outlook_triage.logging_utils import configure_logging
@@ -129,7 +130,7 @@ def test_sanitized_telegram_failure_excludes_credentials_payload_and_url(monkeyp
     )
     monkeypatch.setattr(cli, "load_settings", lambda: configured)
     monkeypatch.setattr(cli, "build_digest", lambda *args: f"# Digest\n\n- {DIGEST_SECRET}")
-    monkeypatch.setattr(cli, "TelegramClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(telegram_delivery, "TelegramClient", lambda *args, **kwargs: client)
 
     with pytest.raises(TelegramError, match="unreachable after retries") as captured:
         cli.run(Namespace(command="digest", telegram=True, verbose=True))

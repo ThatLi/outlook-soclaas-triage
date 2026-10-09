@@ -171,13 +171,27 @@ def test_429_respects_retry_after():
     assert delays == [3.0]
 
 
-@pytest.mark.parametrize("status", [400, 401, 403])
-def test_non_retryable_errors(status):
-    session = Session([Response(status, {"ok": False, "description": "Unauthorized token value"})])
+def test_plain_message_omits_parse_mode():
+    session = Session([Response()])
+    TelegramClient("secret", "7", session=session).send_plain_message("plain * text")
+    assert "parse_mode" not in session.calls[0][1]
+
+
+@pytest.mark.parametrize(
+    ("status", "description", "category"),
+    [
+        (400, "Bad Request: can't parse entities", "content"),
+        (401, "Unauthorized token value", "credentials"),
+        (403, "Forbidden: bot was blocked by the user", "access"),
+    ],
+)
+def test_non_retryable_errors(status, description, category):
+    session = Session([Response(status, {"ok": False, "description": description})])
     with pytest.raises(TelegramError) as captured:
         TelegramClient("secret-value", "7", session=session).send_message("hello")
     assert "secret-value" not in str(captured.value)
     assert len(session.calls) == 1
+    assert captured.value.category == category
 
 
 def test_network_and_5xx_are_retried():
@@ -186,6 +200,13 @@ def test_network_and_5xx_are_retried():
     TelegramClient("secret", "7", session=session, sleep=delays.append).send_message("hello")
     assert len(session.calls) == 3
     assert len(delays) == 2
+
+
+def test_exhausted_network_retry_is_classified_transient():
+    session = Session([requests.ConnectionError("offline") for _ in range(5)])
+    with pytest.raises(TelegramError) as captured:
+        TelegramClient("secret", "7", session=session, sleep=lambda _: None).send_message("hello")
+    assert captured.value.category == "transient"
 
 
 def test_invalid_json_is_sanitized():

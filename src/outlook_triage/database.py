@@ -48,6 +48,25 @@ CREATE TABLE IF NOT EXISTS runs (
     processed_count INTEGER NOT NULL DEFAULT 0, skipped_count INTEGER NOT NULL DEFAULT 0,
     failed_count INTEGER NOT NULL DEFAULT 0, error_summary TEXT
 );
+CREATE TABLE IF NOT EXISTS telegram_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest_date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    chunks_json TEXT NOT NULL,
+    next_chunk INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','needs_attention','delivered','expired')),
+    last_attempt_at TEXT,
+    last_error_category TEXT,
+    last_error TEXT,
+    notified_at TEXT,
+    delayed_notice_sent INTEGER NOT NULL DEFAULT 0,
+    fallback_notice_attempted INTEGER NOT NULL DEFAULT 0,
+    delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_deliveries_status_created
+    ON telegram_deliveries(status, created_at, id);
 """
 
 
@@ -213,9 +232,135 @@ class Database:
                 "last_sync": sync["last_success_at"] if sync else None,
                 "last_run": dict(last_run) if last_run else None}
 
+    def active_telegram_delivery(self, digest_date: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """SELECT * FROM telegram_deliveries
+               WHERE digest_date=? AND status IN ('pending','needs_attention')
+               ORDER BY id ASC LIMIT 1""",
+            (digest_date,),
+        ).fetchone()
+
+    def enqueue_telegram_delivery(self, digest_date: str, chunks: list[str], created_at: str) -> sqlite3.Row:
+        with self.transaction() as conn:
+            existing = conn.execute(
+                """SELECT * FROM telegram_deliveries
+                   WHERE digest_date=? AND status IN ('pending','needs_attention')
+                   ORDER BY id ASC LIMIT 1""",
+                (digest_date,),
+            ).fetchone()
+            if existing:
+                return existing
+            cursor = conn.execute(
+                """INSERT INTO telegram_deliveries(digest_date, created_at, chunks_json)
+                   VALUES (?, ?, ?)""",
+                (digest_date, created_at, json.dumps(chunks, ensure_ascii=False)),
+            )
+            delivery_id = int(cursor.lastrowid)
+            row = conn.execute("SELECT * FROM telegram_deliveries WHERE id=?", (delivery_id,)).fetchone()
+            assert row is not None
+            return row
+
+    @staticmethod
+    def telegram_delivery_chunks(row: sqlite3.Row) -> list[str]:
+        value = json.loads(str(row["chunks_json"]))
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError("Stored Telegram delivery has invalid chunks")
+        return value
+
+    def expire_telegram_deliveries(self, created_before: str) -> int:
+        cursor = self.connection.execute(
+            """UPDATE telegram_deliveries SET status='expired', chunks_json='[]'
+               WHERE status IN ('pending','needs_attention') AND created_at < ?""",
+            (created_before,),
+        )
+        self.connection.commit()
+        return cursor.rowcount
+
+    def pending_telegram_deliveries(self) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """SELECT * FROM telegram_deliveries WHERE status='pending'
+               ORDER BY created_at ASC, id ASC"""
+        ).fetchall()
+
+    def telegram_deliveries_with_status(self, status: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM telegram_deliveries WHERE status=? ORDER BY created_at ASC, id ASC",
+            (status,),
+        ).fetchall()
+
+    def start_telegram_attempt(self, delivery_id: int, attempted_at: str) -> sqlite3.Row:
+        self.connection.execute(
+            """UPDATE telegram_deliveries
+               SET attempt_count=attempt_count+1, last_attempt_at=? WHERE id=?""",
+            (attempted_at, delivery_id),
+        )
+        self.connection.commit()
+        row = self.connection.execute("SELECT * FROM telegram_deliveries WHERE id=?", (delivery_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Telegram delivery {delivery_id} was not found")
+        return row
+
+    def mark_telegram_chunk_sent(self, delivery_id: int, next_chunk: int, total_chunks: int, sent_at: str) -> None:
+        delivered = next_chunk >= total_chunks
+        self.connection.execute(
+            """UPDATE telegram_deliveries
+               SET next_chunk=?, status=?, delivered_at=?, last_error_category=NULL, last_error=NULL,
+                   chunks_json=CASE WHEN ? THEN '[]' ELSE chunks_json END
+               WHERE id=?""",
+            (
+                next_chunk,
+                "delivered" if delivered else "pending",
+                sent_at if delivered else None,
+                int(delivered),
+                delivery_id,
+            ),
+        )
+        self.connection.commit()
+
+    def mark_telegram_delayed_notice_sent(self, delivery_id: int) -> None:
+        self.connection.execute(
+            "UPDATE telegram_deliveries SET delayed_notice_sent=1 WHERE id=?", (delivery_id,)
+        )
+        self.connection.commit()
+
+    def mark_telegram_fallback_attempted(self, delivery_id: int) -> None:
+        self.connection.execute(
+            "UPDATE telegram_deliveries SET fallback_notice_attempted=1 WHERE id=?", (delivery_id,)
+        )
+        self.connection.commit()
+
+    def mark_telegram_delivery_error(
+        self, delivery_id: int, *, status: str, category: str, message: str, attempted_at: str
+    ) -> None:
+        self.connection.execute(
+            """UPDATE telegram_deliveries
+               SET status=?, last_attempt_at=?, last_error_category=?, last_error=? WHERE id=?""",
+            (status, attempted_at, category, message[:500], delivery_id),
+        )
+        self.connection.commit()
+
+    def mark_telegram_notification_sent(self, delivery_ids: list[int], notified_at: str) -> None:
+        if not delivery_ids:
+            return
+        placeholders = ",".join("?" for _ in delivery_ids)
+        self.connection.execute(
+            f"UPDATE telegram_deliveries SET notified_at=? WHERE id IN ({placeholders})",
+            (notified_at, *delivery_ids),
+        )
+        self.connection.commit()
+
+    def reactivate_telegram_deliveries(self) -> int:
+        cursor = self.connection.execute(
+            """UPDATE telegram_deliveries
+               SET status='pending', notified_at=NULL, last_error_category=NULL, last_error=NULL
+               WHERE status='needs_attention'"""
+        )
+        self.connection.commit()
+        return cursor.rowcount
+
     def export_debug_schema(self) -> dict:
         result = {}
-        for table in ("emails", "tasks", "sync_state", "runs"):
+        for table in ("emails", "tasks", "sync_state", "runs", "telegram_deliveries"):
             rows = self.connection.execute(f"PRAGMA table_info({table})").fetchall()
             result[table] = [row["name"] for row in rows]
         return json.loads(json.dumps(result))

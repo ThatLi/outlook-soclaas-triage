@@ -18,6 +18,7 @@ from .outlook import OutlookClient
 from .service import retry_failed, synchronize
 from .soclaas import SoCLaaSClient
 from .telegram import TelegramClient, TelegramError
+from .telegram_delivery import deliver_pending, enqueue_digest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands.add_parser("telegram-chats", help="List recent private chats after messaging the bot")
     commands.add_parser("telegram-test", help="Send a harmless test message to the configured private chat")
+    commands.add_parser("telegram-retry", help="Retry queued Telegram digests after correcting delivery problems")
     return parser
 
 
@@ -203,24 +205,49 @@ def run(args: argparse.Namespace) -> int:
     try:
         if args.command == "tasks":
             return _run_tasks(args, db)
+        if args.command == "telegram-retry":
+            now = datetime.now(settings.timezone)
+            with process_lock(settings.state_dir / "telegram-delivery.lock"):
+                reactivated = db.reactivate_telegram_deliveries()
+                result = deliver_pending(db, settings, logger, now=now)
+            outcome = "paused for user intervention" if result.needs_attention else "complete"
+            print(
+                f"Telegram retry {outcome}: reactivated={reactivated} "
+                f"delivered={result.completed_deliveries} needs_attention={result.needs_attention} "
+                f"expired={result.expired}"
+            )
+            return 0
         if args.command == "digest":
             now = datetime.now(settings.timezone)
-            text = build_digest(db, settings, now)
-            target = save_digest(text, settings.reports_dir, now.date())
-            if args.telegram:
-                settings.require_telegram()
+            if not args.telegram:
+                text = build_digest(db, settings, now)
+                target = save_digest(text, settings.reports_dir, now.date())
+                print(text)
+                print(f"Saved: {target}")
+                return 0
+
+            with process_lock(settings.state_dir / "telegram-delivery.lock"):
+                digest_date = now.date().isoformat()
+                active = db.active_telegram_delivery(digest_date)
+                if active is None:
+                    text = build_digest(db, settings, now)
+                    target = save_digest(text, settings.reports_dir, now.date())
+                    active = enqueue_digest(db, digest_date, text, now.isoformat(timespec="seconds"))
+                    print(text)
+                    print(f"Saved: {target}")
+                else:
+                    print(f"Reusing queued Telegram digest for {digest_date}; the saved report was not regenerated.")
                 try:
-                    delivered = TelegramClient(
-                        settings.telegram_bot_token or "",
-                        settings.telegram_chat_id,
-                        timeout=settings.telegram_timeout_seconds,
-                    ).send_digest(text)
+                    result = deliver_pending(db, settings, logger, now=now)
                 except TelegramError as exc:
-                    logger.error("Telegram digest delivery failed: %s", exc)
+                    logger.error("Telegram digest delivery failed; delivery remains pending: %s", exc)
                     raise
-                print(f"Telegram delivery complete: {delivered} message(s).")
-            print(text)
-            print(f"Saved: {target}")
+            outcome = "paused for user intervention" if result.needs_attention else "complete"
+            print(
+                f"Telegram delivery {outcome}: deliveries={result.completed_deliveries} "
+                f"messages={result.delivered_messages} needs_attention={result.needs_attention} "
+                f"expired={result.expired}"
+            )
             return 0
         if args.command in {"sync", "retry-failed"}:
             ai = SoCLaaSClient(settings)

@@ -72,6 +72,8 @@ def test_scheduler_plan_contains_complete_windows_task_definition(tmp_path):
     assert digest["name"] == "Test Outlook Triage - Digest"
     assert digest["arguments"] == "digest"
     assert digest["triggerTimes"] == ["08:00"]
+    assert digest["restartCount"] == 0
+    assert digest["restartInterval"] is None
     assert all(Path(task["workingDirectory"]) == project.resolve() for task in plan["tasks"])
 
 
@@ -81,6 +83,8 @@ def test_scheduler_plan_enables_telegram_without_mutating_tasks(tmp_path):
     assert plan["telegramEnabled"] is True
     assert plan["tasks"][1]["arguments"] == "digest --telegram"
     assert "Telegram" in plan["tasks"][1]["description"]
+    assert plan["tasks"][1]["restartCount"] == 47
+    assert plan["tasks"][1]["restartInterval"] == "PT30M"
 
 
 def test_scheduler_plan_resolves_default_project_directory():
