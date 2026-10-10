@@ -7,15 +7,113 @@ import sqlite3
 import time
 from typing import Any, Callable
 
-from .config import Settings
+from .config import ConfigurationError, Settings
 from .database import Database
+from .digest import build_digest
 from .locking import AlreadyRunning, process_lock
+from .operations import run_retry, run_sync
 from .outlook import OutlookClient, OutlookError
-from .telegram import TelegramClient, TelegramError
+from .telegram import TelegramClient, TelegramError, format_digest
 from .telegram_commands import HELP_TEXT, format_body_preview, format_status, format_task_list, parse_command
 
 
 TERMINAL_UPDATE_STATES = {"responded", "failed"}
+
+
+def _counts_message(action: str, counts: dict[str, int]) -> str:
+    label = "Synchronization" if action in {"sync", "list"} else "Classification retry"
+    message = (
+        f"{label} complete: processed={counts.get('processed', 0)}, "
+        f"skipped={counts.get('skipped', 0)}, failed={counts.get('failed', 0)}, "
+        f"unchanged={counts.get('unchanged', 0)}."
+    )
+    if counts.get("failed", 0):
+        message += " Some messages remain pending or failed; the digest may be incomplete."
+    return message
+
+
+def _send_live_digest(db: Database, settings: Settings, telegram: TelegramClient) -> None:
+    markdown = build_digest(db, settings)
+    for chunk in format_digest(markdown):
+        telegram.send_message(chunk)
+
+
+def _process_operation(
+    command: Any,
+    existing: Any,
+    update_id: int,
+    db: Database,
+    settings: Settings,
+    telegram: TelegramClient,
+    logger: logging.Logger,
+) -> bool:
+    already_applied = existing is not None and str(existing["status"]) == "applied"
+    try:
+        if already_applied:
+            if command.action == "list":
+                telegram.send_plain_message(
+                    "The synchronization already completed; here is the current live digest."
+                )
+                _send_live_digest(db, settings, telegram)
+            else:
+                telegram.send_plain_message(
+                    "This operation already completed. Use /status for the current local state."
+                )
+            db.set_telegram_update_status(update_id, "responded")
+            return True
+
+        progress = {
+            "list": "Synchronizing Outlook and building a fresh digest…",
+            "sync": "Synchronizing Outlook…",
+            "retry": f"Retrying up to {command.limit} pending or failed classifications…",
+        }[command.action]
+        telegram.send_plain_message(f"⏳ {progress}")
+        counts = (
+            run_retry(db, settings, logger, limit=command.limit)
+            if command.action == "retry"
+            else run_sync(db, settings, logger)
+        )
+        db.set_telegram_update_status(update_id, "applied")
+        telegram.send_plain_message(_counts_message(command.action, counts))
+        if command.action == "list":
+            _send_live_digest(db, settings, telegram)
+        db.set_telegram_update_status(update_id, "responded")
+        return True
+    except TelegramError:
+        raise
+    except AlreadyRunning:
+        message, category = (
+            "Outlook is busy with another operation. Please try again shortly.", "busy"
+        )
+    except ConfigurationError:
+        message, category = (
+            "Local configuration is incomplete. Check the application log and configuration, then try again.",
+            "configuration",
+        )
+    except OutlookError:
+        message, category = (
+            "Outlook could not complete the operation. Check the local application log and try again.",
+            "outlook",
+        )
+    except sqlite3.Error:
+        message, category = (
+            "The local database could not complete the operation. Check the local application log and try again.",
+            "database",
+        )
+    except RuntimeError:
+        message, category = (
+            "The classification service could not complete the operation. Check the local application log and try again.",
+            "classification",
+        )
+    except Exception:
+        message, category = (
+            "The operation could not be completed. Check the local application log and try again.",
+            "operation",
+        )
+    logger.error("Telegram %s operation failed (%s)", command.action, category)
+    telegram.send_plain_message(message)
+    db.set_telegram_update_status(update_id, "failed", error_category=category)
+    return True
 
 
 def _apply_task_actions(
@@ -95,6 +193,10 @@ def process_update(
         telegram.send_plain_message(HELP_TEXT)
         db.set_telegram_update_status(update_id, "responded")
         return True
+    if command.action in {"list", "sync", "retry"}:
+        return _process_operation(
+            command, existing, update_id, db, settings, telegram, logger
+        )
     if command.action == "status":
         try:
             telegram.send_message(format_status(db.operational_status()))

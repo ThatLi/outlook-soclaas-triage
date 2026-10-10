@@ -10,12 +10,12 @@ from pathlib import Path
 from .config import ConfigurationError, Settings, ensure_runtime_directories, load_settings
 from .database import Database
 from .digest import build_digest, save_digest
-from .filters import clean_body, load_rules, sender_details
+from .filters import clean_body, sender_details
 from .locking import AlreadyRunning, process_lock
 from .logging_utils import configure_logging
 from .models import EmailForClassification
+from .operations import run_retry, run_sync
 from .outlook import OutlookClient
-from .service import retry_failed, synchronize
 from .soclaas import SoCLaaSClient
 from .telegram import TelegramClient, TelegramError
 from .telegram_delivery import deliver_pending, enqueue_digest
@@ -281,19 +281,11 @@ def run(args: argparse.Namespace) -> int:
             )
             return 0
         if args.command in {"sync", "retry-failed"}:
-            ai = SoCLaaSClient(settings)
-            rules = load_rules(settings.rules_file)
-            with process_lock(settings.lock_dir):
-                with OutlookClient(settings.outlook_profile, timezone=settings.timezone) as outlook:
-                    if args.command == "sync":
-                        counts = synchronize(
-                            db=db, outlook=outlook, ai=ai, rules=rules, settings=settings, logger=logger
-                        )
-                    else:
-                        counts = retry_failed(
-                            db=db, outlook=outlook, ai=ai, rules=rules, settings=settings,
-                            logger=logger, limit=args.limit,
-                        )
+            counts = (
+                run_sync(db, settings, logger)
+                if args.command == "sync"
+                else run_retry(db, settings, logger, limit=args.limit)
+            )
             print(" ".join(f"{key}={value}" for key, value in counts.items()))
             return 0 if counts["failed"] == 0 else 2
     finally:
