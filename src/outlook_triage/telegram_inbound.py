@@ -11,21 +11,25 @@ from .database import Database
 from .locking import AlreadyRunning, process_lock
 from .outlook import OutlookClient, OutlookError
 from .telegram import TelegramClient, TelegramError
-from .telegram_commands import HELP_TEXT, TelegramCommand, format_body_preview, parse_command
+from .telegram_commands import HELP_TEXT, format_body_preview, parse_command
 
 
 TERMINAL_UPDATE_STATES = {"responded", "failed"}
 
 
 def _mark_read(
-    row: Any,
+    rows: list[Any],
+    update_id: int,
+    db: Database,
     settings: Settings,
     *,
     outlook_factory: Callable[..., OutlookClient],
 ) -> None:
     with process_lock(settings.lock_dir):
         with outlook_factory(settings.outlook_profile, timezone=settings.timezone) as outlook:
-            outlook.mark_read(str(row["source_id"]), str(row["store_id"]))
+            for row in rows:
+                outlook.mark_read(str(row["source_id"]), str(row["store_id"]))
+                db.mark_telegram_update_task_applied(update_id, int(row["task_id"]))
 
 
 def _show_body(
@@ -76,8 +80,8 @@ def process_update(
 
     command = parse_command(str(message.get("text") or ""))
     command_name = command.action if command else "invalid"
-    task_id = command.task_id if command else None
-    db.record_telegram_update(update_id, str(settings.telegram_chat_id), command_name, task_id)
+    task_ids = command.task_ids if command else ()
+    db.record_telegram_update(update_id, str(settings.telegram_chat_id), command_name, task_ids)
 
     if command is None:
         telegram.send_plain_message(f"Command not recognized.\n\n{HELP_TEXT}")
@@ -88,24 +92,48 @@ def process_update(
         db.set_telegram_update_status(update_id, "responded")
         return True
 
-    row = db.task_email(command.task_id or 0)
-    if row is None:
-        telegram.send_message(f"Task <code>#{command.task_id}</code> was not found.")
+    rows_by_id = {
+        task_id: row
+        for task_id in command.task_ids
+        if (row := db.task_email(task_id)) is not None
+    }
+    missing = [task_id for task_id in command.task_ids if task_id not in rows_by_id]
+    if missing:
+        missing_labels = ", ".join(f"<code>#{task_id}</code>" for task_id in missing)
+        noun = "Task" if len(missing) == 1 else "Tasks"
+        verb = "was" if len(missing) == 1 else "were"
+        telegram.send_message(f"{noun} {missing_labels} {verb} not found. No emails were changed.")
         db.set_telegram_update_status(update_id, "failed", error_category="not_found")
         return True
 
     try:
-        current = db.telegram_update(update_id)
         if command.action == "read":
-            if current is None or str(current["status"]) != "applied":
-                _mark_read(row, settings, outlook_factory=outlook_factory)
+            pending_ids = db.telegram_update_task_ids(update_id, status="pending")
+            if pending_ids:
+                _mark_read(
+                    [rows_by_id[task_id] for task_id in pending_ids],
+                    update_id,
+                    db,
+                    settings,
+                    outlook_factory=outlook_factory,
+                )
                 db.set_telegram_update_status(update_id, "applied")
-            telegram.send_message(
-                f"✅ Email is marked as read: <code>#{command.task_id}</code> — "
-                f"{html.escape(str(row['subject']))}"
-            )
+            if len(command.task_ids) == 1:
+                task_id = command.task_ids[0]
+                telegram.send_message(
+                    f"✅ Email is marked as read: <code>#{task_id}</code> — "
+                    f"{html.escape(str(rows_by_id[task_id]['subject']))}"
+                )
+            else:
+                labels = ", ".join(f"<code>#{task_id}</code>" for task_id in command.task_ids)
+                telegram.send_message(
+                    f"✅ {len(command.task_ids)} emails are marked as read: {labels}"
+                )
         else:
-            _show_body(row, telegram, settings, outlook_factory=outlook_factory)
+            _show_body(
+                rows_by_id[command.task_ids[0]], telegram, settings,
+                outlook_factory=outlook_factory,
+            )
         db.set_telegram_update_status(update_id, "responded")
         return True
     except AlreadyRunning:

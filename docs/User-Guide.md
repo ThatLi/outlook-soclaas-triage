@@ -193,7 +193,7 @@ The configured private chat supports:
 
 | Command | Behavior |
 | --- | --- |
-| `/read #42` | Marks the task's original Outlook email read. The local task status is unchanged. Repeating the command is safe. |
+| `/read #42` or `/read #42 #51 68` | Marks one or more tasks' original Outlook emails read. IDs are deduplicated, every ID is validated before any email changes, and local task statuses remain unchanged. Repeating the command is safe. |
 | `/show #42` | Sends a bounded, escaped plain-text body preview without changing Outlook read state. Attachment contents are never read. |
 | `/help` or `/start` | Shows the available commands. |
 

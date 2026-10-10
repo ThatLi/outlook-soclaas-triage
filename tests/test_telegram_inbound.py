@@ -12,17 +12,17 @@ from outlook_triage.telegram import TelegramError
 from outlook_triage.telegram_inbound import ensure_polling_available, listen, poll_once, process_updates
 
 
-def _seed_task(db: Database) -> None:
+def _seed_task(db: Database, source_id: str = "entry-1", subject: str = "Private <report>") -> None:
     db.store_sync_batch(
         [{
-            "messageKey": "store-1:entry-1", "sourceId": "entry-1", "storeId": "store-1",
+            "messageKey": f"store-1:{source_id}", "sourceId": source_id, "storeId": "store-1",
             "sender": {"emailAddress": {"name": "Alice", "address": "a@example.test"}},
-            "subject": "Private <report>", "receivedDateTime": "2026-10-10T08:00:00+08:00",
+            "subject": subject, "receivedDateTime": "2026-10-10T08:00:00+08:00",
         }],
         "2026-10-10T08:00:00+08:00",
     )
     db.save_classification(
-        "store-1:entry-1",
+        f"store-1:{source_id}",
         EmailClassification.model_validate({
             "requires_action": True, "urgency": "normal", "action_type": "other",
             "task": "Review it", "deadline": None, "deadline_raw": None,
@@ -54,6 +54,7 @@ class Telegram:
 
 class Outlook:
     read_calls = 0
+    read_items = []
     show_calls = 0
 
     def __init__(self, *args, **kwargs):
@@ -67,6 +68,7 @@ class Outlook:
 
     def mark_read(self, source_id, store_id):
         type(self).read_calls += 1
+        type(self).read_items.append(source_id)
         return True
 
     def get_body_preview(self, source_id, store_id, *, limit):
@@ -84,6 +86,7 @@ def _update(update_id, text, chat=7):
 @pytest.fixture(autouse=True)
 def reset_outlook():
     Outlook.read_calls = 0
+    Outlook.read_items = []
     Outlook.show_calls = 0
 
 
@@ -114,6 +117,42 @@ def test_duplicate_read_does_not_repeat_mutation(settings):
         process_updates(db, configured, Telegram(), [update], logging.getLogger(), outlook_factory=Outlook)
         process_updates(db, configured, Telegram(), [update], logging.getLogger(), outlook_factory=Outlook)
         assert Outlook.read_calls == 1
+    finally:
+        db.close()
+
+
+def test_read_accepts_multiple_deduplicated_task_ids(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    try:
+        _seed_task(db, "entry-1", "First")
+        _seed_task(db, "entry-2", "Second")
+        process_updates(
+            db, configured, telegram, [_update(11, "/read #1 #2 #1")],
+            logging.getLogger(), outlook_factory=Outlook,
+        )
+        assert Outlook.read_items == ["entry-1", "entry-2"]
+        assert db.telegram_update_task_ids(11, status="applied") == [1, 2]
+        assert "2 emails are marked as read" in telegram.messages[0]
+        assert telegram.messages[0].count("#1") == 1
+    finally:
+        db.close()
+
+
+def test_multi_read_validates_all_task_ids_before_changing_outlook(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    try:
+        _seed_task(db)
+        process_updates(
+            db, configured, telegram, [_update(12, "/read #1 #999")],
+            logging.getLogger(), outlook_factory=Outlook,
+        )
+        assert Outlook.read_calls == 0
+        assert "#999" in telegram.messages[0]
+        assert "No emails were changed" in telegram.messages[0]
     finally:
         db.close()
 

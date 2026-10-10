@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 HELP_TEXT = (
     "Available commands:\n"
-    "/read #<task-id> — mark the original Outlook email as read\n"
+    "/read #<task-id> [#<task-id> ...] — mark one or more original Outlook emails as read\n"
     "/show #<task-id> — show a bounded preview without changing read state\n"
     "/help — show this message"
 )
@@ -16,11 +16,15 @@ HELP_TEXT = (
 @dataclass(frozen=True)
 class TelegramCommand:
     action: str
-    task_id: int | None = None
+    task_ids: tuple[int, ...] = ()
+
+    @property
+    def task_id(self) -> int | None:
+        return self.task_ids[0] if len(self.task_ids) == 1 else None
 
 
 _COMMAND_RE = re.compile(
-    r"^/(?P<action>read|show|help|start)(?:@[A-Za-z0-9_]+)?(?:\s+(?P<argument>\S+))?\s*$",
+    r"^/(?P<action>read|show|help|start)(?:@[A-Za-z0-9_]+)?(?:\s+(?P<arguments>.+?))?\s*$",
     re.IGNORECASE,
 )
 
@@ -30,12 +34,18 @@ def parse_command(text: str) -> TelegramCommand | None:
     if not match:
         return None
     action = match.group("action").lower()
-    argument = match.group("argument")
+    arguments = match.group("arguments")
     if action in {"help", "start"}:
-        return TelegramCommand("help") if argument is None else None
-    if argument is None or not re.fullmatch(r"#?[1-9]\d*", argument):
+        return TelegramCommand("help") if arguments is None else None
+    if arguments is None:
         return None
-    return TelegramCommand(action, int(argument.removeprefix("#")))
+    values = arguments.split()
+    if not values or any(not re.fullmatch(r"#?[1-9]\d*", value) for value in values):
+        return None
+    task_ids = tuple(dict.fromkeys(int(value.removeprefix("#")) for value in values))
+    if action == "show" and len(task_ids) != 1:
+        return None
+    return TelegramCommand(action, task_ids)
 
 
 def format_body_preview(
