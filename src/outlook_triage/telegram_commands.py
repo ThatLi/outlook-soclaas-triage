@@ -89,6 +89,58 @@ def parse_command(text: str) -> TelegramCommand | None:
     return TelegramCommand(action, task_ids)
 
 
+def format_status(snapshot: dict) -> str:
+    last_run = snapshot.get("last_run") or {}
+    task_counts = snapshot.get("task_counts") or {}
+    return "\n".join(
+        (
+            "📊 <b>TRIAGE STATUS</b>",
+            "",
+            f"Last successful sync: <b>{html.escape(str(snapshot.get('last_sync') or 'never'))}</b>",
+            f"Latest sync run: <b>{html.escape(str(last_run.get('status') or 'none'))}</b>",
+            f"Pending or failed classifications: <b>{int(snapshot.get('pending_or_failed') or 0)}</b>",
+            "",
+            "<b>TASKS</b>",
+            f"Open: <b>{int(task_counts.get('open', 0))}</b>",
+            f"Waiting: <b>{int(task_counts.get('waiting', 0))}</b>",
+            f"Done: <b>{int(task_counts.get('done', 0))}</b>",
+            f"Dismissed: <b>{int(task_counts.get('dismissed', 0))}</b>",
+        )
+    )
+
+
+def format_task_list(rows: list, status_filter: str, *, max_plain_chars: int = 3400) -> list[str]:
+    title = f"📋 <b>TASKS · {html.escape(status_filter.upper())} · {len(rows)}</b>"
+    if not rows:
+        return [f"{title}\n\nNo matching tasks."]
+    raw_items = []
+    for row in rows:
+        deadline = f" — due {row['deadline']}" if row["deadline"] else ""
+        raw_items.append(
+            f"#{row['id']} [{str(row['status']).upper()}] [{str(row['urgency']).upper()}] "
+            f"{row['description']}{deadline}"
+        )
+    body_limit = max(200, max_plain_chars - 200)
+    pieces: list[str] = []
+    current = ""
+    for item in raw_items:
+        item_parts = [item[index:index + body_limit] for index in range(0, len(item), body_limit)]
+        for part in item_parts:
+            candidate = part if not current else f"{current}\n\n{part}"
+            if current and len(candidate) > body_limit:
+                pieces.append(current)
+                current = part
+            else:
+                current = candidate
+    if current:
+        pieces.append(current)
+    total = len(pieces)
+    return [
+        f"{title}{'' if total == 1 else f' — PART {index} OF {total}'}\n\n{html.escape(piece)}"
+        for index, piece in enumerate(pieces, start=1)
+    ]
+
+
 def format_body_preview(
     subject: str,
     body: str,

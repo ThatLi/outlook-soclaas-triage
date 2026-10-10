@@ -12,7 +12,7 @@ from .database import Database
 from .locking import AlreadyRunning, process_lock
 from .outlook import OutlookClient, OutlookError
 from .telegram import TelegramClient, TelegramError
-from .telegram_commands import HELP_TEXT, format_body_preview, parse_command
+from .telegram_commands import HELP_TEXT, format_body_preview, format_status, format_task_list, parse_command
 
 
 TERMINAL_UPDATE_STATES = {"responded", "failed"}
@@ -95,6 +95,28 @@ def process_update(
         telegram.send_plain_message(HELP_TEXT)
         db.set_telegram_update_status(update_id, "responded")
         return True
+    if command.action == "status":
+        try:
+            telegram.send_message(format_status(db.operational_status()))
+            db.set_telegram_update_status(update_id, "responded")
+            return True
+        except sqlite3.Error as exc:
+            logger.error("Telegram status query failed (%s)", type(exc).__name__)
+            telegram.send_plain_message("The local status database could not be read. Check the local log and try again.")
+            db.set_telegram_update_status(update_id, "failed", error_category="database")
+            return True
+    if command.action == "tasks":
+        try:
+            selected_status = None if command.option == "all" else command.option
+            for chunk in format_task_list(db.list_tasks(selected_status), command.option or "all"):
+                telegram.send_message(chunk)
+            db.set_telegram_update_status(update_id, "responded")
+            return True
+        except sqlite3.Error as exc:
+            logger.error("Telegram task-list query failed (%s)", type(exc).__name__)
+            telegram.send_plain_message("The local task database could not be read. Check the local log and try again.")
+            db.set_telegram_update_status(update_id, "failed", error_category="database")
+            return True
 
     rows_by_id = {
         task_id: row
@@ -111,21 +133,27 @@ def process_update(
         return True
 
     try:
-        if command.action in {"read", "done", "dismiss"}:
+        if command.action in {"read", "done", "dismiss", "waiting", "reopen"}:
             pending_ids = db.telegram_update_task_ids(update_id, status="pending")
             if pending_ids:
                 task_status = {
                     "done": "done",
                     "dismiss": "dismissed",
+                    "waiting": "waiting",
+                    "reopen": "open",
                 }.get(command.action)
-                _apply_task_actions(
-                    [rows_by_id[task_id] for task_id in pending_ids],
-                    update_id,
-                    db,
-                    settings,
-                    task_status=task_status,
-                    outlook_factory=outlook_factory,
-                )
+                if command.action in {"waiting", "reopen"}:
+                    for task_id in pending_ids:
+                        db.apply_telegram_task(update_id, task_id, task_status=task_status)
+                else:
+                    _apply_task_actions(
+                        [rows_by_id[task_id] for task_id in pending_ids],
+                        update_id,
+                        db,
+                        settings,
+                        task_status=task_status,
+                        outlook_factory=outlook_factory,
+                    )
                 db.set_telegram_update_status(update_id, "applied")
             if command.action == "read" and len(command.task_ids) == 1:
                 task_id = command.task_ids[0]
@@ -138,6 +166,11 @@ def process_update(
                 telegram.send_message(
                     f"✅ {len(command.task_ids)} emails are marked as read: {labels}"
                 )
+            elif command.action in {"waiting", "reopen"}:
+                target = "waiting" if command.action == "waiting" else "open"
+                labels = ", ".join(f"<code>#{task_id}</code>" for task_id in command.task_ids)
+                noun = "Task" if len(command.task_ids) == 1 else f"{len(command.task_ids)} tasks"
+                telegram.send_message(f"✅ {noun} marked {target}: {labels}")
             elif len(command.task_ids) == 1:
                 task_id = command.task_ids[0]
                 target = "done" if command.action == "done" else "dismissed"

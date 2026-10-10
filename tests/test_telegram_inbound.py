@@ -14,7 +14,12 @@ from outlook_triage.telegram import TelegramError
 from outlook_triage.telegram_inbound import ensure_polling_available, listen, poll_once, process_updates
 
 
-def _seed_task(db: Database, source_id: str = "entry-1", subject: str = "Private <report>") -> None:
+def _seed_task(
+    db: Database,
+    source_id: str = "entry-1",
+    subject: str = "Private <report>",
+    task_description: str = "Review it",
+) -> None:
     db.store_sync_batch(
         [{
             "messageKey": f"store-1:{source_id}", "sourceId": source_id, "storeId": "store-1",
@@ -27,7 +32,7 @@ def _seed_task(db: Database, source_id: str = "entry-1", subject: str = "Private
         f"store-1:{source_id}",
         EmailClassification.model_validate({
             "requires_action": True, "urgency": "normal", "action_type": "other",
-            "task": "Review it", "deadline": None, "deadline_raw": None,
+            "task": task_description, "deadline": None, "deadline_raw": None,
             "summary": "Summary", "category": "action", "reason": "Requested", "confidence": 1,
         }),
         "model",
@@ -278,6 +283,60 @@ def test_done_reports_local_task_update_failure_via_telegram(monkeypatch, settin
         assert db.task_email(1)["task_status"] == "open"
         assert "local task status could not be updated" in telegram.messages[0]
         assert db.telegram_update(25)["error_category"] == "database"
+    finally:
+        db.close()
+
+
+def test_waiting_and_reopen_update_local_state_without_outlook(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+
+    class NoOutlook:
+        def __init__(self, *args, **kwargs):
+            pytest.fail("Outlook must not be accessed")
+
+    try:
+        _seed_task(db, "entry-1", "First")
+        _seed_task(db, "entry-2", "Second")
+        process_updates(
+            db, configured, telegram, [_update(30, "/waiting #1 #2 #1")],
+            logging.getLogger(), outlook_factory=NoOutlook,
+        )
+        assert [row["status"] for row in db.list_tasks()] == ["waiting", "waiting"]
+        process_updates(
+            db, configured, telegram, [_update(31, "/reopen #1 #2")],
+            logging.getLogger(), outlook_factory=NoOutlook,
+        )
+        assert [row["status"] for row in db.list_tasks()] == ["open", "open"]
+        assert "2 tasks marked waiting" in telegram.messages[0]
+        assert "2 tasks marked open" in telegram.messages[1]
+    finally:
+        db.close()
+
+
+def test_tasks_filter_and_status_use_database_only(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+
+    class NoOutlook:
+        def __init__(self, *args, **kwargs):
+            pytest.fail("Outlook must not be accessed")
+
+    try:
+        _seed_task(db, "entry-1", task_description="Open <task>")
+        _seed_task(db, "entry-2", "Done task")
+        db.set_task_status(2, "done")
+        process_updates(
+            db, configured, telegram, [_update(32, "/tasks open"), _update(33, "/status")],
+            logging.getLogger(), outlook_factory=NoOutlook,
+        )
+        assert "Open &lt;task&gt;" in telegram.messages[0]
+        assert "Done task" not in telegram.messages[0]
+        assert "TRIAGE STATUS" in telegram.messages[1]
+        assert "Open: <b>1</b>" in telegram.messages[1]
+        assert "Done: <b>1</b>" in telegram.messages[1]
     finally:
         db.close()
 

@@ -1,4 +1,10 @@
-from outlook_triage.telegram_commands import BOT_COMMANDS, format_body_preview, parse_command
+from outlook_triage.telegram_commands import (
+    BOT_COMMANDS,
+    format_body_preview,
+    format_status,
+    format_task_list,
+    parse_command,
+)
 
 
 def test_parse_supported_commands_and_bot_suffixes():
@@ -40,3 +46,19 @@ def test_body_preview_is_escaped_chunked_and_truncated():
     assert "A &lt; B" in chunks[0]
     assert "Preview truncated." in chunks[-1]
     assert all(len(chunk.replace("&lt;", "<").replace("&gt;", ">")) < 700 for chunk in chunks)
+
+
+def test_status_and_task_list_are_escaped_and_bounded():
+    status = format_status({
+        "last_sync": "never <yet>", "last_run": {"status": "failed"},
+        "pending_or_failed": 2, "task_counts": {"open": 3, "waiting": 1},
+    })
+    assert "never &lt;yet&gt;" in status
+    rows = [{
+        "id": index, "status": "open", "urgency": "normal",
+        "description": "Review <private> " + ("detail " * 100), "deadline": None,
+    } for index in range(1, 20)]
+    chunks = format_task_list(rows, "open", max_plain_chars=500)
+    assert len(chunks) > 1
+    assert all("<private>" not in chunk for chunk in chunks)
+    assert all(len(chunk) < 1000 for chunk in chunks)
