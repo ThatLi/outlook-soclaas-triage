@@ -244,7 +244,13 @@ class Database:
 
     def set_telegram_offset(self, next_update_id: int) -> None:
         self.connection.execute(
-            "UPDATE telegram_state SET next_update_id=? WHERE singleton=1", (next_update_id,)
+            """UPDATE telegram_state
+               SET next_update_id=CASE
+                   WHEN next_update_id IS NULL OR next_update_id < ? THEN ?
+                   ELSE next_update_id
+               END
+               WHERE singleton=1""",
+            (next_update_id, next_update_id),
         )
         self.connection.commit()
 

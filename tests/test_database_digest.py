@@ -52,6 +52,10 @@ def test_database_deduplicates_email_and_task(settings):
         assert "html" not in columns
         assert "source_id" in columns
         assert "store_id" in columns
+        update_columns = db.export_debug_schema()["telegram_updates"]
+        assert "body" not in update_columns
+        assert "source_id" not in update_columns
+        assert "command" in update_columns
     finally:
         db.close()
 

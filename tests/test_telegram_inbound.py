@@ -180,6 +180,8 @@ def test_poll_once_uses_saved_offset(settings):
         assert poll_once(db, configured, telegram, logging.getLogger(), timeout=0) == 1
         assert telegram.polls == [(12, 0)]
         assert db.telegram_offset() == 13
+        db.set_telegram_offset(10)
+        assert db.telegram_offset() == 13
     finally:
         db.close()
 

@@ -91,3 +91,13 @@ def test_scheduler_resolves_default_project_dir_inside_script_body():
     assert "[string]$ProjectDir =" not in script
     assert "$scriptPath = $PSCommandPath" in script
     assert "$scriptPath = $MyInvocation.MyCommand.Path" in script
+
+
+def test_documentation_discloses_show_privacy_and_read_mutation():
+    root = cli.Path(__file__).parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    guide = (root / "docs" / "User-Guide.md").read_text(encoding="utf-8")
+    assert "authorized `/read`" in readme
+    assert "`/show #42`" in guide
+    assert "TELEGRAM_BODY_PREVIEW_CHARS" in guide
+    assert "does not store raw command text, email bodies, or Outlook identifiers" in guide
