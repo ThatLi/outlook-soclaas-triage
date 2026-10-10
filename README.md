@@ -4,6 +4,8 @@ A local, read-only Windows application that reads the signed-in **classic Outloo
 
 It does not require Microsoft Entra app registration. It never sends, moves, flags, deletes, or modifies Outlook messages, and it never reads attachment contents. Confirm that sending cleaned email text to SoCLaaS is permitted by your organization and acceptable under SoCLaaS's retention and logging policies.
 
+For daily operation, the complete command reference, scheduling, Telegram delivery, and troubleshooting, see the [User Guide](docs/User-Guide.md).
+
 ## Requirements
 
 - Windows 10 or 11.
@@ -41,6 +43,7 @@ Edit `%APPDATA%\OutlookTriage\secrets.env`:
 SOCLAAS_API_KEY=your-api-key
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+TELEGRAM_TIMEOUT_SECONDS=20
 SOCLAAS_BASE_URL=https://soclaas-api.comp.nus.edu.sg/v1
 EMAIL_TRIAGE_MODEL=
 OUTLOOK_PROFILE=
@@ -49,6 +52,7 @@ OUTLOOK_TRIAGE_BOOTSTRAP_DAYS=7
 OUTLOOK_TRIAGE_OVERLAP_HOURS=8
 OUTLOOK_TRIAGE_MAX_BODY_CHARS=12000
 OUTLOOK_TRIAGE_DIGEST_HORIZON_DAYS=7
+OUTLOOK_TRIAGE_TIMEOUT_SECONDS=45
 ```
 
 Leave `OUTLOOK_PROFILE` blank to use the default profile. Set it only when classic Outlook has multiple named profiles and the default is not the intended one.
@@ -90,116 +94,7 @@ ignored_subject_patterns:
 
 Matches are case-insensitive and subject patterns are regular expressions. The application deliberately does not discard all `no-reply` or low-importance messages.
 
-## 5. Run synchronization and task management
-
-The first synchronization considers messages received during the previous seven days. Later runs consider messages from the last high-water timestamp with an eight-hour overlap and deduplicate by Outlook store ID and EntryID. Within that window, synchronization reads and classifies messages that are unread or have an active follow-up flag. Read messages without an active flag, including messages whose flags are completed, are skipped without reading their bodies.
-
-Pinned messages are not included unless they are also unread or actively flagged. Classic Outlook's documented object model does not expose pin state, so the application does not attempt to infer it from unsupported properties.
-
-```powershell
-outlook-triage sync
-outlook-triage retry-failed
-outlook-triage digest
-```
-
-Task commands:
-
-```powershell
-outlook-triage tasks list
-outlook-triage tasks list --status waiting
-outlook-triage tasks done 12
-outlook-triage tasks waiting 15
-outlook-triage tasks dismiss 18
-outlook-triage tasks reopen 12
-```
-
-These commands update only the local SQLite database. Digest files are saved under `%LOCALAPPDATA%\OutlookTriage\reports`.
-
-## Telegram digest delivery
-
-Telegram delivery is optional. Digest generation always saves the local Markdown file first, and the normal `digest` command never sends it anywhere.
-
-1. In Telegram, use the verified **@BotFather**, run `/newbot`, and keep the returned token private.
-2. Open the new bot's private chat and send `/start`.
-3. Put the token in `%APPDATA%\OutlookTriage\secrets.env`:
-
-   ```dotenv
-   TELEGRAM_BOT_TOKEN=replace-with-real-token
-   ```
-
-4. Discover the private chat ID:
-
-   ```powershell
-   outlook-triage telegram-chats
-   ```
-
-5. Add the displayed numeric ID to the same secrets file:
-
-   ```dotenv
-   TELEGRAM_CHAT_ID=123456789
-   ```
-
-6. Send a harmless test, then send a real digest:
-
-   ```powershell
-   outlook-triage telegram-test
-   outlook-triage digest --telegram
-   ```
-
-Telegram delivery starts with a summary containing open-action counts, recent inbox activity, and synchronization status. Non-empty task sections follow as compact checklists, with related priorities grouped when they fit; other open actions are preferentially grouped with waiting/follow-up items. Long sections are HTML-escaped and split into ordered continuation messages. If delivery fails, the saved Markdown report remains available locally. Transient failures return an error so Windows can retry; permanent failures pause the queue for intervention. The bot token, Telegram response bodies, and digest contents are not written to application logs.
-
-Formatted Telegram messages are frozen in a local SQLite outbox before the first send. Transient network, rate-limit, and Telegram server failures remain queued and the Telegram-enabled scheduled task retries them every 30 minutes. Confirmed chunks are not resent; a resumed digest begins with a delayed-delivery notice. Queued digests are delivered oldest-first and expire after seven days, while their Markdown reports remain available locally.
-
-Invalid credentials, a missing or blocked chat, and rejected formatting pause automatic delivery and show a Windows tray warning instead of repeatedly retrying. Correct the Telegram configuration or application issue, then reactivate and send the queue with:
-
-```powershell
-outlook-triage telegram-retry
-```
-
-Telegram does not provide a request idempotency key. If Telegram accepts a chunk but the network fails before acknowledging it, that one chunk may appear twice after recovery.
-
-To enable delivery for the 08:00 scheduled digest, register the tasks with:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\register_windows_tasks.ps1 -EnableTelegram
-```
-
-Re-run this registration command after upgrading an existing installation so the digest task receives the 30-minute transient-failure retry policy.
-
-Preview the complete task definitions without reading or changing Task Scheduler:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\register_windows_tasks.ps1 -EnableTelegram -ShowPlan
-```
-
-Telegram receives summaries, task descriptions, sender information, and deadlines. Pending Telegram chunks contain the same information and are retained in the local SQLite database for up to seven days. Do not enable this feature unless sending that information to Telegram is permitted by your organization.
-
-## 6. Register native Windows schedules
-
-Only schedule the application after the manual checks and two consecutive synchronization runs succeed:
-
-```powershell
-& .\scripts\register_windows_tasks.ps1
-```
-
-It registers interactive tasks for the current Windows user:
-
-- Synchronization at 03:50, then every four hours through 23:50.
-- Digest generation daily at 08:00, with 30-minute retries after transient Telegram failures when enabled.
-- Start-after-missed-run behavior and overlapping-run prevention.
-
-## Failure behavior
-
-- Missing or new-Outlook-only installation: stop and request classic Outlook.
-- Missing Outlook profile or Inbox: stop without changing Outlook.
-- Object Model Guard denial: explain the policy failure and do not bypass it.
-- COM-busy or unavailable Outlook: fail the run and preserve the synchronization watermark.
-- SoCLaaS `429`, timeout, connection failure, or `5xx`: retry with exponential backoff and jitter.
-- SoCLaaS `401` or `403`: stop with a configuration error.
-- Invalid model JSON: attempt one repair, then retain the message for `retry-failed`.
-- Message metadata and the high-water timestamp are committed before classification, so interrupted AI processing does not lose messages.
-
-Logs rotate under `%LOCALAPPDATA%\OutlookTriage\logs` and do not include message bodies, API keys, or Outlook EntryIDs in full.
+Continue with the [User Guide](docs/User-Guide.md) for synchronization, task management, digests, Telegram delivery, and Windows scheduling.
 
 ## Test
 
@@ -208,4 +103,3 @@ python -m pytest
 ```
 
 All Outlook tests use mock COM objects and do not open or access a live mailbox.
-
