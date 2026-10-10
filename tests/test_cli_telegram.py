@@ -98,6 +98,11 @@ def test_documentation_discloses_show_privacy_and_read_mutation():
     readme = (root / "README.md").read_text(encoding="utf-8")
     guide = (root / "docs" / "User-Guide.md").read_text(encoding="utf-8")
     assert "authorized `/read`, `/done`, or `/dismiss`" in readme
+    assert "`/waiting` and `/reopen` change local workflow state only" in readme
+    assert "`/list` always means synchronize first" in guide
+    assert "Use `/tasks` or `/status` for a fast database-only view" in guide
+    assert "remain local-only administration" in guide
+    assert "without repeating synchronization, classification, or task mutations" in guide
     assert "`/show #42`" in guide
     assert "`/done #42`" in guide
     assert "`/dismiss #42`" in guide
