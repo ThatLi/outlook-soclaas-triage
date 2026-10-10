@@ -2,7 +2,6 @@
 param(
     [string]$ProjectDir,
     [string]$TaskPrefix = "Outlook SoCLaaS Triage",
-    [switch]$ReplaceLegacyWslTasks,
     [switch]$EnableTelegram,
     [switch]$ShowPlan
 )
@@ -17,7 +16,6 @@ if ([string]::IsNullOrWhiteSpace($scriptPath)) {
     throw "Unable to determine the scheduler script location. Re-run with -ProjectDir <project-path>."
 }
 $scriptDirectory = Split-Path -Parent $scriptPath
-Import-Module (Join-Path $scriptDirectory "OutlookTriage.Scheduler.psm1") -Force
 
 if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
     $ProjectDir = Split-Path -Parent $scriptDirectory
@@ -80,18 +78,6 @@ if ($ShowPlan) {
 
 if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "The Windows virtual environment is missing: $executable"
-}
-
-$taskNames = @($plan.tasks | ForEach-Object { $_.name })
-foreach ($taskName in $taskNames) {
-    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    $existingExecutables = if ($existing) { @($existing.Actions | ForEach-Object { $_.Execute }) } else { @() }
-    $decision = Get-OutlookTriageReplacementDecision `
-        -ExistingActionExecutables $existingExecutables `
-        -ReplaceLegacyWslTasks:$ReplaceLegacyWslTasks
-    if (-not $decision.allowed) {
-        throw "'$taskName' still invokes WSL. Re-run with -ReplaceLegacyWslTasks after reviewing the legacy task."
-    }
 }
 
 $syncAction = New-ScheduledTaskAction -Execute $executable -Argument "sync" -WorkingDirectory $project

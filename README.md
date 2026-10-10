@@ -33,8 +33,6 @@ outlook-triage init
 - `%LOCALAPPDATA%\OutlookTriage\reports\`
 - `%LOCALAPPDATA%\OutlookTriage\logs\`
 
-The Windows database has a new filename and does not modify the old WSL/Graph database.
-
 ## 2. Configure SoCLaaS and Outlook
 
 Edit `%APPDATA%\OutlookTriage\secrets.env`:
@@ -189,62 +187,6 @@ It registers interactive tasks for the current Windows user:
 - Synchronization at 03:50, then every four hours through 23:50.
 - Digest generation daily at 08:00, with 30-minute retries after transient Telegram failures when enabled.
 - Start-after-missed-run behavior and overlapping-run prevention.
-
-If legacy tasks still invoke WSL, the script refuses to overwrite them. Inspect them first:
-
-```powershell
-& .\scripts\manage_legacy_wsl_tasks.ps1
-& .\scripts\manage_legacy_wsl_tasks.ps1 -Remove -WhatIf
-```
-
-Remove only the two confirmed legacy WSL tasks:
-
-```powershell
-& .\scripts\manage_legacy_wsl_tasks.ps1 -Remove
-```
-
-Alternatively, replace them while registering the native tasks:
-
-```powershell
-& .\scripts\register_windows_tasks.ps1 -ReplaceLegacyWslTasks
-```
-
-## 7. Archive and remove the old WSL installation
-
-The rollback utility targets only:
-
-- `~/outlook-triage`
-- `~/.config/outlook-triage`
-- `~/.local/share/outlook-triage`
-- `~/.local/state/outlook-triage`
-
-Run it from a WSL terminal using the script's `/mnt/c/...` path. Review the non-mutating dry run first:
-
-```bash
-bash /mnt/c/PATH/TO/THIS/PROJECT/scripts/rollback_wsl.sh --dry-run
-```
-
-After confirming every printed target, archive and remove the installation:
-
-```bash
-bash /mnt/c/PATH/TO/THIS/PROJECT/scripts/rollback_wsl.sh --execute
-```
-
-Execution creates a private backup under:
-
-```text
-~/outlook-triage-rollback-backups/
-```
-
-The archive includes source, configuration, credentials, database, reports, logs, and the MSAL cache. Reproducible virtual environments and caches are excluded. The script verifies both the tar archive and its SHA-256 checksum before removing anything.
-
-Because the archive contains credentials, keep it private. The script prints the exact restore command, equivalent to:
-
-```bash
-tar -xzf ~/outlook-triage-rollback-backups/outlook-triage-wsl-TIMESTAMP.tar.gz -C ~
-```
-
-Retain the backup until the Windows-native version has completed several successful scheduled runs. Delete it manually only when it is no longer required.
 
 ## Failure behavior
 
