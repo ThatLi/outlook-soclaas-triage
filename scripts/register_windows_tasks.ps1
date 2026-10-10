@@ -3,6 +3,7 @@ param(
     [string]$ProjectDir,
     [string]$TaskPrefix = "Outlook SoCLaaS Triage",
     [switch]$EnableTelegram,
+    [switch]$EnableTelegramCommands,
     [switch]$ShowPlan
 )
 
@@ -32,12 +33,44 @@ $digestDescription = if ($EnableTelegram) {
 } else {
     "Generate the local Outlook triage digest daily at 08:00."
 }
+$listenerDescription = "Listen for authorized Telegram commands that act on classic Outlook messages."
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+$plannedTasks = @(
+    [ordered]@{
+        name = "$TaskPrefix - Sync"
+        arguments = "sync"
+        workingDirectory = $project
+        triggerTimes = $syncTimes
+        description = $syncDescription
+    },
+    [ordered]@{
+        name = "$TaskPrefix - Digest"
+        arguments = $digestArguments
+        workingDirectory = $project
+        triggerTimes = @("08:00")
+        description = $digestDescription
+        restartCount = $(if ($EnableTelegram) { 47 } else { 0 })
+        restartInterval = $(if ($EnableTelegram) { "PT30M" } else { $null })
+    }
+)
+if ($EnableTelegramCommands) {
+    $plannedTasks += [ordered]@{
+        name = "$TaskPrefix - Telegram Commands"
+        arguments = "telegram-listen"
+        workingDirectory = $project
+        trigger = "AtLogOn"
+        description = $listenerDescription
+        restartCount = 999
+        restartInterval = "PT1M"
+    }
+}
 
 $plan = [ordered]@{
     projectDir = $project
     executable = $executable
     telegramEnabled = [bool]$EnableTelegram
+    telegramCommandsEnabled = [bool]$EnableTelegramCommands
     settings = [ordered]@{
         startWhenAvailable = $true
         allowStartOnBatteries = $true
@@ -51,24 +84,7 @@ $plan = [ordered]@{
         logonType = "Interactive"
         runLevel = "Limited"
     }
-    tasks = @(
-        [ordered]@{
-            name = "$TaskPrefix - Sync"
-            arguments = "sync"
-            workingDirectory = $project
-            triggerTimes = $syncTimes
-            description = $syncDescription
-        },
-        [ordered]@{
-            name = "$TaskPrefix - Digest"
-            arguments = $digestArguments
-            workingDirectory = $project
-            triggerTimes = @("08:00")
-            description = $digestDescription
-            restartCount = $(if ($EnableTelegram) { 47 } else { 0 })
-            restartInterval = $(if ($EnableTelegram) { "PT30M" } else { $null })
-        }
-    )
+    tasks = $plannedTasks
 }
 
 if ($ShowPlan) {
@@ -125,6 +141,22 @@ Register-ScheduledTask -TaskName "$TaskPrefix - Digest" -Action $digestAction -T
     -Settings $digestSettings -Principal $principal `
     -Description $digestDescription `
     -Force | Out-Null
+
+if ($EnableTelegramCommands) {
+    $listenerAction = New-ScheduledTaskAction -Execute $executable -Argument "telegram-listen" -WorkingDirectory $project
+    $listenerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+    $listenerSettings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+    Register-ScheduledTask -TaskName "$TaskPrefix - Telegram Commands" -Action $listenerAction `
+        -Trigger $listenerTrigger -Settings $listenerSettings -Principal $principal `
+        -Description $listenerDescription -Force | Out-Null
+}
 
 Write-Host "Registered native Windows tasks for $currentUser."
 Write-Host "They run only while that user is logged in."

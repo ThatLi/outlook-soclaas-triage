@@ -9,7 +9,7 @@ import pytest
 from outlook_triage.database import Database
 from outlook_triage.models import EmailClassification
 from outlook_triage.telegram import TelegramError
-from outlook_triage.telegram_inbound import process_updates
+from outlook_triage.telegram_inbound import ensure_polling_available, listen, poll_once, process_updates
 
 
 def _seed_task(db: Database) -> None:
@@ -44,6 +44,12 @@ class Telegram:
 
     def send_plain_message(self, text, **kwargs):
         self.send_message(text)
+
+    def get_updates(self, *, offset=None, timeout=30):
+        return []
+
+    def webhook_info(self):
+        return {"url": ""}
 
 
 class Outlook:
@@ -153,3 +159,54 @@ def test_transient_response_failure_leaves_offset_unadvanced(settings):
         assert Outlook.read_calls == 1
     finally:
         db.close()
+
+
+def test_poll_once_uses_saved_offset(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+
+    class PollingTelegram(Telegram):
+        def __init__(self):
+            super().__init__()
+            self.polls = []
+
+        def get_updates(self, *, offset=None, timeout=30):
+            self.polls.append((offset, timeout))
+            return [_update(12, "/help")]
+
+    telegram = PollingTelegram()
+    try:
+        db.set_telegram_offset(12)
+        assert poll_once(db, configured, telegram, logging.getLogger(), timeout=0) == 1
+        assert telegram.polls == [(12, 0)]
+        assert db.telegram_offset() == 13
+    finally:
+        db.close()
+
+
+def test_listener_backs_off_after_transient_failure(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    delays = []
+
+    class FlakyTelegram(Telegram):
+        calls = 0
+
+        def get_updates(self, *, offset=None, timeout=30):
+            self.calls += 1
+            if self.calls == 1:
+                raise TelegramError("offline", category="transient")
+            return []
+
+    try:
+        assert listen(db, configured, FlakyTelegram(), logging.getLogger(), max_cycles=2, sleep=delays.append) == 0
+        assert delays == [1.0]
+    finally:
+        db.close()
+
+
+def test_webhook_blocks_polling():
+    telegram = Telegram()
+    telegram.webhook_info = lambda: {"url": "https://example.test/hook"}
+    with pytest.raises(TelegramError, match="webhook"):
+        ensure_polling_available(telegram)

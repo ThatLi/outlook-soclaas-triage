@@ -12,14 +12,14 @@ class AlreadyRunning(RuntimeError):
 
 
 @contextmanager
-def process_lock(path: Path, stale_after_seconds: int = 7200):
+def process_lock(path: Path, stale_after_seconds: int = 7200, *, label: str = "synchronization"):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         path.mkdir()
     except FileExistsError:
         age = time.time() - path.stat().st_mtime
         if age <= stale_after_seconds:
-            raise AlreadyRunning(f"Another synchronization is running (lock: {path})")
+            raise AlreadyRunning(f"Another {label} is running (lock: {path})")
         shutil.rmtree(path)
         path.mkdir()
     try:

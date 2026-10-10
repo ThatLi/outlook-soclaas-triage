@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import html
 import logging
+import os
+import time
 from typing import Any, Callable
 
 from .config import Settings
@@ -137,4 +139,61 @@ def process_updates(
             break
         db.set_telegram_offset(update_id + 1)
         processed += 1
+    return processed
+
+
+def ensure_polling_available(telegram: TelegramClient) -> None:
+    if str(telegram.webhook_info().get("url") or "").strip():
+        raise TelegramError(
+            "Telegram polling is unavailable while a webhook is configured; clear the webhook before starting the listener",
+            category="configuration",
+        )
+
+
+def poll_once(
+    db: Database,
+    settings: Settings,
+    telegram: TelegramClient,
+    logger: logging.Logger,
+    *,
+    timeout: int = 30,
+    outlook_factory: Callable[..., OutlookClient] = OutlookClient,
+) -> int:
+    updates = telegram.get_updates(offset=db.telegram_offset(), timeout=timeout)
+    return process_updates(
+        db, settings, telegram, updates, logger, outlook_factory=outlook_factory
+    )
+
+
+def listen(
+    db: Database,
+    settings: Settings,
+    telegram: TelegramClient,
+    logger: logging.Logger,
+    *,
+    timeout: int = 30,
+    sleep: Callable[[float], None] = time.sleep,
+    max_cycles: int | None = None,
+    outlook_factory: Callable[..., OutlookClient] = OutlookClient,
+) -> int:
+    processed = 0
+    failures = 0
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        cycles += 1
+        receiver_lock = settings.state_dir / "telegram-receiver.lock"
+        if receiver_lock.exists():
+            os.utime(receiver_lock, None)
+        try:
+            processed += poll_once(
+                db, settings, telegram, logger, timeout=timeout, outlook_factory=outlook_factory
+            )
+            failures = 0
+        except TelegramError as exc:
+            if exc.category != "transient":
+                raise
+            failures += 1
+            delay = min(60.0, float(2 ** min(failures - 1, 6)))
+            logger.warning("Telegram listener temporarily unavailable; retrying in %.0f seconds", delay)
+            sleep(delay)
     return processed

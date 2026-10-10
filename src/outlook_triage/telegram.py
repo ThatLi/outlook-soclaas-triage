@@ -414,10 +414,18 @@ class TelegramClient:
         category = "credentials" if response_status == 401 else "access" if response_status == 403 else "content"
         return TelegramError(fallback, category=category, status_code=response_status)
 
-    def _request(self, method: str, data: dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        data: dict[str, Any] | None = None,
+        *,
+        request_timeout: float | None = None,
+    ) -> Any:
         for attempt in range(5):
             try:
-                response = self.session.post(self._url(method), data=data or {}, timeout=self.timeout)
+                response = self.session.post(
+                    self._url(method), data=data or {}, timeout=request_timeout or self.timeout
+                )
             except requests.RequestException as exc:
                 if attempt == 4:
                     raise TelegramError("Telegram was unreachable after retries", category="transient") from exc
@@ -475,8 +483,14 @@ class TelegramClient:
         }
         if offset is not None:
             data["offset"] = offset
-        result = self._request("getUpdates", data)
+        result = self._request(
+            "getUpdates", data, request_timeout=max(self.timeout, float(timeout) + 5.0)
+        )
         return [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+
+    def webhook_info(self) -> dict[str, Any]:
+        result = self._request("getWebhookInfo")
+        return result if isinstance(result, dict) else {}
 
     def send_message(self, text: str, *, chat_id: str | None = None, parse_mode: str | None = "HTML") -> None:
         target = chat_id or self.chat_id

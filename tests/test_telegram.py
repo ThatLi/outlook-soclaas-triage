@@ -152,6 +152,12 @@ def test_get_updates_sends_offset_timeout_and_message_filter():
     assert session.calls[0][1] == {
         "offset": 9, "timeout": 30, "allowed_updates": '["message"]'
     }
+    assert session.calls[0][2] == 35.0
+
+
+def test_webhook_info_returns_mapping():
+    session = Session([Response(payload={"ok": True, "result": {"url": ""}})])
+    assert TelegramClient("secret", session=session).webhook_info() == {"url": ""}
 
 
 def test_send_digest_delivers_chunks_in_order():
