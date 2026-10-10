@@ -89,3 +89,35 @@ def test_digest_groups_open_task_and_reports_sync(settings):
     finally:
         db.close()
 
+
+def test_digest_omits_done_and_dismissed_tasks(settings):
+    db = Database(settings.database_file)
+    try:
+        for index, status in ((1, "done"), (2, "dismissed")):
+            message = _message(f"entry-{index}")
+            db.store_sync_batch([message], message["receivedDateTime"])
+            db.save_classification(
+                message["messageKey"],
+                EmailClassification.model_validate(
+                    {
+                        "requires_action": True,
+                        "urgency": "normal",
+                        "action_type": "other",
+                        "task": f"Hidden task {index}",
+                        "deadline": None,
+                        "deadline_raw": None,
+                        "summary": "Hidden after completion.",
+                        "category": "action",
+                        "reason": "Test task.",
+                        "confidence": 1,
+                    }
+                ),
+                "test-model",
+            )
+            assert db.set_task_status(index, status) is True
+        text = build_digest(db, settings, datetime.fromisoformat("2026-09-28T08:00:00+08:00"))
+        assert "Hidden task 1" not in text
+        assert "Hidden task 2" not in text
+    finally:
+        db.close()
+

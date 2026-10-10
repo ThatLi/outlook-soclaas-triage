@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 import os
+import sqlite3
 import time
 from typing import Any, Callable
 
@@ -17,19 +18,22 @@ from .telegram_commands import HELP_TEXT, format_body_preview, parse_command
 TERMINAL_UPDATE_STATES = {"responded", "failed"}
 
 
-def _mark_read(
+def _apply_task_actions(
     rows: list[Any],
     update_id: int,
     db: Database,
     settings: Settings,
     *,
+    task_status: str | None,
     outlook_factory: Callable[..., OutlookClient],
 ) -> None:
     with process_lock(settings.lock_dir):
         with outlook_factory(settings.outlook_profile, timezone=settings.timezone) as outlook:
             for row in rows:
                 outlook.mark_read(str(row["source_id"]), str(row["store_id"]))
-                db.mark_telegram_update_task_applied(update_id, int(row["task_id"]))
+                db.apply_telegram_task(
+                    update_id, int(row["task_id"]), task_status=task_status
+                )
 
 
 def _show_body(
@@ -107,27 +111,45 @@ def process_update(
         return True
 
     try:
-        if command.action == "read":
+        if command.action in {"read", "done", "dismiss"}:
             pending_ids = db.telegram_update_task_ids(update_id, status="pending")
             if pending_ids:
-                _mark_read(
+                task_status = {
+                    "done": "done",
+                    "dismiss": "dismissed",
+                }.get(command.action)
+                _apply_task_actions(
                     [rows_by_id[task_id] for task_id in pending_ids],
                     update_id,
                     db,
                     settings,
+                    task_status=task_status,
                     outlook_factory=outlook_factory,
                 )
                 db.set_telegram_update_status(update_id, "applied")
-            if len(command.task_ids) == 1:
+            if command.action == "read" and len(command.task_ids) == 1:
                 task_id = command.task_ids[0]
                 telegram.send_message(
                     f"✅ Email is marked as read: <code>#{task_id}</code> — "
                     f"{html.escape(str(rows_by_id[task_id]['subject']))}"
                 )
-            else:
+            elif command.action == "read":
                 labels = ", ".join(f"<code>#{task_id}</code>" for task_id in command.task_ids)
                 telegram.send_message(
                     f"✅ {len(command.task_ids)} emails are marked as read: {labels}"
+                )
+            elif len(command.task_ids) == 1:
+                task_id = command.task_ids[0]
+                target = "done" if command.action == "done" else "dismissed"
+                telegram.send_message(
+                    f"✅ Task <code>#{task_id}</code> marked {target} and its email marked read — "
+                    f"{html.escape(str(rows_by_id[task_id]['subject']))}"
+                )
+            else:
+                target = "done" if command.action == "done" else "dismissed"
+                labels = ", ".join(f"<code>#{task_id}</code>" for task_id in command.task_ids)
+                telegram.send_message(
+                    f"✅ {len(command.task_ids)} tasks marked {target} and their emails marked read: {labels}"
                 )
         else:
             _show_body(
@@ -142,8 +164,26 @@ def process_update(
         return True
     except OutlookError as exc:
         logger.warning("Telegram Outlook command failed: %s", exc)
-        telegram.send_plain_message("The Outlook operation failed. Check the local application log and try again.")
+        applied = len(db.telegram_update_task_ids(update_id, status="applied"))
+        if command.action in {"done", "dismiss"} and applied:
+            telegram.send_plain_message(
+                f"The Outlook operation failed after {applied} of {len(command.task_ids)} tasks completed. "
+                "Completed changes were kept; remaining task statuses were not changed. "
+                "Resending the command is safe."
+            )
+        else:
+            telegram.send_plain_message(
+                "The Outlook operation failed. Check the local application log and try again."
+            )
         db.set_telegram_update_status(update_id, "failed", error_category="outlook")
+        return True
+    except (sqlite3.Error, KeyError) as exc:
+        logger.error("Telegram task-state update failed (%s)", type(exc).__name__)
+        telegram.send_plain_message(
+            "The email may already be marked read, but the local task status could not be updated. "
+            "No later tasks in this command were processed. Check the local application log and resend the command."
+        )
+        db.set_telegram_update_status(update_id, "failed", error_category="database")
         return True
 
 

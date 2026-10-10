@@ -294,12 +294,25 @@ class Database:
         return [int(row["task_id"]) for row in rows]
 
     def mark_telegram_update_task_applied(self, update_id: int, task_id: int) -> None:
-        self.connection.execute(
-            """UPDATE telegram_update_tasks SET status='applied'
-               WHERE update_id=? AND task_id=?""",
-            (update_id, task_id),
-        )
-        self.connection.commit()
+        self.apply_telegram_task(update_id, task_id)
+
+    def apply_telegram_task(
+        self, update_id: int, task_id: int, *, task_status: str | None = None
+    ) -> None:
+        now = local_now()
+        with self.transaction() as conn:
+            if task_status is not None:
+                cursor = conn.execute(
+                    "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                    (task_status, now, task_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Task {task_id} was not found")
+            conn.execute(
+                """UPDATE telegram_update_tasks SET status='applied'
+                   WHERE update_id=? AND task_id=?""",
+                (update_id, task_id),
+            )
 
     def set_telegram_update_status(
         self, update_id: int, status: str, *, error_category: str | None = None
