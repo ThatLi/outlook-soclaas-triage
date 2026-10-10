@@ -51,6 +51,7 @@ def test_scheduler_plan_contains_complete_windows_task_definition(tmp_path):
     assert Path(plan["projectDir"]) == project.resolve()
     assert Path(plan["executable"]) == (project / ".venv" / "Scripts" / "outlook-triage.exe").resolve()
     assert plan["telegramEnabled"] is False
+    assert plan["telegramCommandsEnabled"] is False
     assert plan["settings"] == {
         "startWhenAvailable": True,
         "allowStartOnBatteries": True,
@@ -83,6 +84,17 @@ def test_scheduler_plan_enables_telegram_without_mutating_tasks(tmp_path):
     assert "Telegram" in plan["tasks"][1]["description"]
     assert plan["tasks"][1]["restartCount"] == 47
     assert plan["tasks"][1]["restartInterval"] == "PT30M"
+
+
+def test_scheduler_plan_adds_opt_in_telegram_command_listener(tmp_path):
+    project = _fake_project(tmp_path)
+    plan = _show_plan("-ProjectDir", str(project), "-EnableTelegramCommands")
+    assert plan["telegramCommandsEnabled"] is True
+    assert len(plan["tasks"]) == 3
+    listener = plan["tasks"][2]
+    assert listener["arguments"] == "telegram-listen"
+    assert listener["trigger"] == "AtLogOn"
+    assert listener["restartInterval"] == "PT1M"
 
 
 def test_scheduler_plan_resolves_default_project_directory():
@@ -134,7 +146,7 @@ def test_scheduler_never_starts_a_task_immediately():
     assert "Start-ScheduledTask" not in source
 
 
-def test_scheduler_uses_timed_catch_up_without_startup_or_logon_triggers():
+def test_scheduler_uses_timed_catch_up_for_sync_and_digest():
     source = SCRIPT.read_text(encoding="utf-8")
     plan = _show_plan("-EnableTelegram")
 
@@ -145,14 +157,13 @@ def test_scheduler_uses_timed_catch_up_without_startup_or_logon_triggers():
     assert plan["tasks"][1]["triggerTimes"] == ["08:00"]
     assert plan["tasks"][1]["arguments"] == "digest --telegram"
     assert "-AtStartup" not in source
-    assert "-AtLogOn" not in source
     assert "-WakeToRun" not in source
 
 
-def test_scheduler_targets_only_the_two_planned_task_names(tmp_path):
+def test_scheduler_targets_only_planned_task_names(tmp_path):
     project = _fake_project(tmp_path)
     plan = _show_plan("-ProjectDir", str(project), "-TaskPrefix", "Exact Prefix")
     assert [task["name"] for task in plan["tasks"]] == ["Exact Prefix - Sync", "Exact Prefix - Digest"]
     source = SCRIPT.read_text(encoding="utf-8")
     assert "Get-ScheduledTask" not in source
-    assert source.count("Register-ScheduledTask") == 2
+    assert source.count("Register-ScheduledTask") == 3

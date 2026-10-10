@@ -19,6 +19,7 @@ from .service import retry_failed, synchronize
 from .soclaas import SoCLaaSClient
 from .telegram import TelegramClient, TelegramError
 from .telegram_delivery import deliver_pending, enqueue_digest
+from .telegram_inbound import ensure_polling_available, listen, poll_once
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("telegram-chats", help="List recent private chats after messaging the bot")
     commands.add_parser("telegram-test", help="Send a harmless test message to the configured private chat")
     commands.add_parser("telegram-retry", help="Retry queued Telegram digests after correcting delivery problems")
+    commands.add_parser("telegram-poll", help="Check once for Telegram commands and exit")
+    commands.add_parser("telegram-listen", help="Continuously listen for Telegram commands")
     return parser
 
 
@@ -77,6 +80,7 @@ SOCLAAS_API_KEY=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 TELEGRAM_TIMEOUT_SECONDS=20
+TELEGRAM_BODY_PREVIEW_CHARS=6000
 SOCLAAS_BASE_URL=https://soclaas-api.comp.nus.edu.sg/v1
 EMAIL_TRIAGE_MODEL=
 OUTLOOK_PROFILE=
@@ -139,11 +143,16 @@ def run(args: argparse.Namespace) -> int:
 
     if args.command == "telegram-chats":
         settings.require_telegram(require_chat=False)
-        telegram = TelegramClient(
-            settings.telegram_bot_token or "",
-            timeout=settings.telegram_timeout_seconds,
-        )
-        chats = telegram.recent_private_chats()
+        with process_lock(
+            settings.state_dir / "telegram-receiver.lock",
+            stale_after_seconds=120,
+            label="Telegram receiver",
+        ):
+            telegram = TelegramClient(
+                settings.telegram_bot_token or "",
+                timeout=settings.telegram_timeout_seconds,
+            )
+            chats = telegram.recent_private_chats()
         if not chats:
             print("No recent private chats found. Open the bot in Telegram, send /start, and try again.")
             return 1
@@ -216,6 +225,26 @@ def run(args: argparse.Namespace) -> int:
                 f"delivered={result.completed_deliveries} needs_attention={result.needs_attention} "
                 f"expired={result.expired}"
             )
+            return 0
+        if args.command in {"telegram-poll", "telegram-listen"}:
+            settings.require_telegram()
+            telegram = TelegramClient(
+                settings.telegram_bot_token or "",
+                settings.telegram_chat_id,
+                timeout=settings.telegram_timeout_seconds,
+            )
+            with process_lock(
+                settings.state_dir / "telegram-receiver.lock",
+                stale_after_seconds=600,
+                label="Telegram receiver",
+            ):
+                ensure_polling_available(telegram)
+                if args.command == "telegram-poll":
+                    processed = poll_once(db, settings, telegram, logger, timeout=0)
+                    print(f"Telegram poll complete: processed={processed}")
+                else:
+                    print("Telegram command listener started. Press Ctrl+C to stop.")
+                    listen(db, settings, telegram, logger)
             return 0
         if args.command == "digest":
             now = datetime.now(settings.timezone)

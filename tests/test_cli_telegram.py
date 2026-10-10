@@ -15,6 +15,8 @@ def test_digest_telegram_flag_is_opt_in():
     assert parser.parse_args(["digest"]).telegram is False
     assert parser.parse_args(["digest", "--telegram"]).telegram is True
     assert parser.parse_args(["telegram-retry"]).command == "telegram-retry"
+    assert parser.parse_args(["telegram-poll"]).command == "telegram-poll"
+    assert parser.parse_args(["telegram-listen"]).command == "telegram-listen"
 
 
 def test_local_digest_does_not_construct_telegram(monkeypatch, settings):
@@ -80,6 +82,8 @@ def test_scheduler_supports_opt_in_telegram_action():
     script = (cli.Path(__file__).parents[1] / "scripts" / "register_windows_tasks.ps1").read_text(encoding="utf-8")
     assert "[switch]$EnableTelegram" in script
     assert '"digest --telegram"' in script
+    assert "[switch]$EnableTelegramCommands" in script
+    assert '"telegram-listen"' in script
 
 
 def test_scheduler_resolves_default_project_dir_inside_script_body():
@@ -87,3 +91,13 @@ def test_scheduler_resolves_default_project_dir_inside_script_body():
     assert "[string]$ProjectDir =" not in script
     assert "$scriptPath = $PSCommandPath" in script
     assert "$scriptPath = $MyInvocation.MyCommand.Path" in script
+
+
+def test_documentation_discloses_show_privacy_and_read_mutation():
+    root = cli.Path(__file__).parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    guide = (root / "docs" / "User-Guide.md").read_text(encoding="utf-8")
+    assert "authorized `/read`" in readme
+    assert "`/show #42`" in guide
+    assert "TELEGRAM_BODY_PREVIEW_CHARS" in guide
+    assert "does not store raw command text, email bodies, or Outlook identifiers" in guide

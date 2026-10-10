@@ -173,6 +173,32 @@ Reactivates queued deliveries that were paused for attention and tries the Teleg
 
 The command resumes stored message chunks; it does not regenerate their Markdown reports. Queued deliveries are processed oldest first.
 
+### `telegram-poll`
+
+```powershell
+outlook-triage telegram-poll
+```
+
+Checks once for inbound commands, processes them in update order, prints the number completed, and exits. Use this for setup and diagnostics. It requires both Telegram settings and refuses to run while a Telegram webhook is configured or another receiver is active.
+
+### `telegram-listen`
+
+```powershell
+outlook-triage telegram-listen
+```
+
+Runs a foreground long-polling listener until interrupted. It uses outbound HTTPS only and does not expose a local HTTP server. Transient Telegram failures use bounded backoff. Run only one listener; a receiver lock prevents this command, `telegram-poll`, and `telegram-chats` from consuming updates concurrently.
+
+The configured private chat supports:
+
+| Command | Behavior |
+| --- | --- |
+| `/read #42` or `/read #42 #51 68` | Marks one or more tasks' original Outlook emails read. IDs are deduplicated, every ID is validated before any email changes, and local task statuses remain unchanged. Repeating the command is safe. |
+| `/show #42` | Sends a bounded, escaped plain-text body preview without changing Outlook read state. Attachment contents are never read. |
+| `/help` or `/start` | Shows the available commands. |
+
+Task IDs are the numeric IDs shown in the digest and `tasks list`. Commands from other chats and bot-authored messages are ignored. The listener briefly acquires the synchronization lock for Outlook access, so synchronization and Telegram commands cannot use Outlook concurrently.
+
 ## Telegram delivery
 
 Telegram is optional. To enable it:
@@ -190,7 +216,7 @@ Transient network, rate-limit, and Telegram server failures leave the delivery p
 
 Queued messages are retained in SQLite for up to seven days and then expire; the local Markdown report remains available. The bot token, Telegram response bodies, and digest contents are not written to application logs.
 
-Telegram receives summaries, task descriptions, sender information, and deadlines. Do not enable delivery unless your organization permits that information to be sent to Telegram.
+Telegram digest delivery receives summaries, task descriptions, sender information, and deadlines. The `/show` command additionally transmits up to `TELEGRAM_BODY_PREVIEW_CHARS` characters of the original plain-text body. Do not enable these features unless your organization permits that information to be sent to Telegram.
 
 ## Windows scheduling
 
@@ -212,6 +238,13 @@ Or register the daily digest with Telegram delivery and transient-failure retrie
 & .\scripts\register_windows_tasks.ps1 -EnableTelegram
 ```
 
+Add the inbound command listener at user logon independently or together with digest delivery:
+
+```powershell
+& .\scripts\register_windows_tasks.ps1 -EnableTelegramCommands
+& .\scripts\register_windows_tasks.ps1 -EnableTelegram -EnableTelegramCommands
+```
+
 The script supports these parameters:
 
 | Parameter | Behavior |
@@ -219,6 +252,7 @@ The script supports these parameters:
 | `-ProjectDir PATH` | Uses another project directory. The default is the parent of the script directory. The project must contain `.venv\Scripts\outlook-triage.exe` when registering tasks. |
 | `-TaskPrefix TEXT` | Changes the scheduled-task name prefix. The default creates `Outlook SoCLaaS Triage - Sync` and `Outlook SoCLaaS Triage - Digest`. |
 | `-EnableTelegram` | Runs `digest --telegram` and gives the digest task up to 47 retries at 30-minute intervals when it exits unsuccessfully. |
+| `-EnableTelegramCommands` | Adds an at-logon `telegram-listen` task with restart-on-failure behavior. |
 | `-ShowPlan` | Prints the complete task plan as JSON and returns without accessing or modifying Task Scheduler. |
 
 For example, preview a custom project and task prefix:
@@ -231,12 +265,13 @@ For example, preview a custom project and task prefix:
     -ShowPlan
 ```
 
-Registration creates or replaces the two named tasks for the current Windows user:
+Registration creates or replaces the two base tasks for the current Windows user and, when enabled, the Telegram Commands task:
 
 - Synchronization at 03:50, 07:50, 11:50, 15:50, 19:50, and 23:50.
 - Digest generation daily at 08:00.
+- Telegram command listening at user logon, with one-minute failure restarts and no execution-time limit.
 
-The tasks run with limited privileges only while that user is logged in. They start after a missed scheduled time when the user becomes available, can run on battery power, do not wake the computer, stop after two hours, and ignore a new trigger while an earlier instance is still running. Re-run registration after moving the project, changing the desired prefix or Telegram mode, or upgrading an older task definition.
+The tasks run with limited privileges only while that user is logged in. They start after a missed scheduled time when the user becomes available, can run on battery power, do not wake the computer, and ignore a new trigger while an earlier instance is still running. Sync and digest runs stop after two hours; the listener has no execution-time limit. Re-run registration after moving the project, changing the desired prefix or Telegram mode, or upgrading an older task definition.
 
 ## Configuration and local data
 
@@ -257,6 +292,7 @@ Values in the process environment override values read from `secrets.env`. Blank
 | `TELEGRAM_BOT_TOKEN` | unset | Optional Telegram bot credential. |
 | `TELEGRAM_CHAT_ID` | unset | Optional private destination chat ID. |
 | `TELEGRAM_TIMEOUT_SECONDS` | `20` | Telegram request timeout. |
+| `TELEGRAM_BODY_PREVIEW_CHARS` | `6000` | Maximum original body characters returned by `/show`. |
 
 Advanced path overrides are available as process environment variables:
 
@@ -272,7 +308,7 @@ Advanced path overrides are available as process environment variables:
 | `OUTLOOK_TRIAGE_LOG_FILE` | `%LOCALAPPDATA%\OutlookTriage\logs\outlook-triage.log` |
 | `OUTLOOK_TRIAGE_LOCK_DIR` | `%LOCALAPPDATA%\OutlookTriage\state\sync.lock` |
 
-The SQLite database contains discovered message metadata, classifications, local tasks, run history, and pending Telegram chunks. Reports are Markdown files. Logs rotate and exclude message bodies, API keys, and full Outlook `EntryID` values.
+The SQLite database contains discovered message metadata, classifications, local tasks, run history, pending Telegram chunks, the inbound update offset, and a minimal command audit. The audit stores command type, task ID, state, authorized chat ID, and sanitized error category; it does not store raw command text, email bodies, or Outlook identifiers. Reports are Markdown files. Logs rotate and exclude message bodies, API keys, and full Outlook `EntryID` values.
 
 ## Filtering behavior
 
@@ -312,6 +348,9 @@ Common failures behave as follows:
 - **The model returns invalid JSON:** the application attempts one repair request, then retains the message for `retry-failed`.
 - **A digest warns that no sync completed or the latest sync failed:** resolve the synchronization problem, run `sync` or `retry-failed`, and generate the digest again.
 - **Telegram delivery needs attention:** inspect the sanitized local log, correct the configuration or chat problem, and run `outlook-triage telegram-retry`.
+- **Telegram listener reports a webhook conflict:** clear the bot's webhook before using long polling; Telegram does not permit both receivers simultaneously.
+- **Telegram listener says another receiver is active:** stop the other listener or wait for `telegram-poll`/`telegram-chats` to finish. Investigate the receiver lock only after confirming no listener process is active.
+- **A Telegram Outlook command fails:** confirm classic Outlook is open and responsive under the scheduled task's interactive Windows user, then retry the command.
 
 Use the global verbose option for interactive diagnosis:
 

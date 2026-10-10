@@ -23,6 +23,7 @@ CONFIG_ENV_NAMES = (
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
     "TELEGRAM_TIMEOUT_SECONDS",
+    "TELEGRAM_BODY_PREVIEW_CHARS",
 )
 
 
@@ -58,7 +59,8 @@ def test_telegram_values_load_from_secrets_file(monkeypatch, tmp_path):
     secrets.write_text(
         "TELEGRAM_BOT_TOKEN=file-token\n"
         "TELEGRAM_CHAT_ID=123456\n"
-        "TELEGRAM_TIMEOUT_SECONDS=12.5\n",
+        "TELEGRAM_TIMEOUT_SECONDS=12.5\n"
+        "TELEGRAM_BODY_PREVIEW_CHARS=4321\n",
         encoding="utf-8",
     )
 
@@ -67,6 +69,7 @@ def test_telegram_values_load_from_secrets_file(monkeypatch, tmp_path):
     assert settings.telegram_bot_token == "file-token"
     assert settings.telegram_chat_id == "123456"
     assert settings.telegram_timeout_seconds == 12.5
+    assert settings.telegram_body_preview_chars == 4321
 
 
 def test_environment_overrides_telegram_secrets_file(monkeypatch, tmp_path):

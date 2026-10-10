@@ -41,12 +41,21 @@ def test_database_deduplicates_email_and_task(settings):
         db.save_classification("store-1:entry-1", classification, "test-model")
         db.save_classification("store-1:entry-1", classification, "test-model")
         assert len(db.list_tasks()) == 1
+        task_email = db.task_email(1)
+        assert task_email is not None
+        assert (task_email["source_id"], task_email["store_id"], task_email["subject"]) == (
+            "entry-1", "store-1", "Report needed"
+        )
         assert db.get_last_received_at() == "2026-09-28T09:00:00+08:00"
         columns = db.export_debug_schema()["emails"]
         assert "body" not in columns
         assert "html" not in columns
         assert "source_id" in columns
         assert "store_id" in columns
+        update_columns = db.export_debug_schema()["telegram_updates"]
+        assert "body" not in update_columns
+        assert "source_id" not in update_columns
+        assert "command" in update_columns
     finally:
         db.close()
 
