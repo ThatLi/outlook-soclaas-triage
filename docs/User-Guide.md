@@ -194,10 +194,14 @@ The configured private chat supports:
 | Command | Behavior |
 | --- | --- |
 | `/read #42` or `/read #42 #51 68` | Marks one or more tasks' original Outlook emails read. IDs are deduplicated, every ID is validated before any email changes, and local task statuses remain unchanged. Repeating the command is safe. |
+| `/done #42` or `/done #42 #51 68` | Marks each original email read and then sets each local task to `done`. |
+| `/dismiss #42` or `/dismiss #42 #51 68` | Marks each original email read and then sets each local task to `dismissed`. |
 | `/show #42` | Sends a bounded, escaped plain-text body preview without changing Outlook read state. Attachment contents are never read. |
 | `/help` or `/start` | Shows the available commands. |
 
-Task IDs are the numeric IDs shown in the digest and `tasks list`. Commands from other chats and bot-authored messages are ignored. The listener briefly acquires the synchronization lock for Outlook access, so synchronization and Telegram commands cannot use Outlook concurrently.
+Task IDs are the numeric IDs shown in the digest and `tasks list`. Batch commands deduplicate IDs and validate the entire list before making changes. For `/done` and `/dismiss`, each local status changes only after that task's Outlook email is successfully marked read; successfully completed earlier items remain changed if a later Outlook operation fails. The bot reports validation, lock, Outlook, and local task-update failures with sanitized retry guidance. Resending a failed command is safe.
+
+Commands from other chats and bot-authored messages are ignored. The listener briefly acquires the synchronization lock for Outlook access, so synchronization and Telegram commands cannot use Outlook concurrently. Tasks in `done` or `dismissed` state are omitted from subsequent digests; marking an email read with `/read` alone does not change its local task or remove it from the digest.
 
 ## Telegram delivery
 
@@ -351,6 +355,7 @@ Common failures behave as follows:
 - **Telegram listener reports a webhook conflict:** clear the bot's webhook before using long polling; Telegram does not permit both receivers simultaneously.
 - **Telegram listener says another receiver is active:** stop the other listener or wait for `telegram-poll`/`telegram-chats` to finish. Investigate the receiver lock only after confirming no listener process is active.
 - **A Telegram Outlook command fails:** confirm classic Outlook is open and responsive under the scheduled task's interactive Windows user, then retry the command.
+- **A batch command partially completes:** the bot reports how many tasks completed. Those task changes are retained; remaining task statuses are unchanged, and resending the complete command is safe.
 
 Use the global verbose option for interactive diagnosis:
 

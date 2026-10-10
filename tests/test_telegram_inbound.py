@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 
 from outlook_triage.database import Database
 from outlook_triage.models import EmailClassification
+from outlook_triage.outlook import OutlookUnavailable
 from outlook_triage.telegram import TelegramError
 from outlook_triage.telegram_inbound import ensure_polling_available, listen, poll_once, process_updates
 
@@ -56,6 +58,7 @@ class Outlook:
     read_calls = 0
     read_items = []
     show_calls = 0
+    fail_on = None
 
     def __init__(self, *args, **kwargs):
         pass
@@ -67,6 +70,8 @@ class Outlook:
         pass
 
     def mark_read(self, source_id, store_id):
+        if source_id == type(self).fail_on:
+            raise OutlookUnavailable("sanitized Outlook failure")
         type(self).read_calls += 1
         type(self).read_items.append(source_id)
         return True
@@ -88,6 +93,7 @@ def reset_outlook():
     Outlook.read_calls = 0
     Outlook.read_items = []
     Outlook.show_calls = 0
+    Outlook.fail_on = None
 
 
 def test_authorized_read_is_applied_and_audited_without_sensitive_data(settings):
@@ -153,6 +159,125 @@ def test_multi_read_validates_all_task_ids_before_changing_outlook(settings):
         assert Outlook.read_calls == 0
         assert "#999" in telegram.messages[0]
         assert "No emails were changed" in telegram.messages[0]
+    finally:
+        db.close()
+
+
+def test_done_marks_multiple_emails_read_and_tasks_done(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    try:
+        _seed_task(db, "entry-1", "First")
+        _seed_task(db, "entry-2", "Second")
+        process_updates(
+            db, configured, telegram, [_update(20, "/done #1 2 #1")],
+            logging.getLogger(), outlook_factory=Outlook,
+        )
+        assert Outlook.read_items == ["entry-1", "entry-2"]
+        assert [row["status"] for row in db.list_tasks()] == ["done", "done"]
+        assert db.telegram_update_task_ids(20, status="applied") == [1, 2]
+        assert "2 tasks marked done" in telegram.messages[0]
+    finally:
+        db.close()
+
+
+def test_dismiss_transitions_existing_state_and_marks_email_read(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    try:
+        _seed_task(db)
+        assert db.set_task_status(1, "done") is True
+        process_updates(
+            db, configured, telegram, [_update(21, "/dismiss #1")],
+            logging.getLogger(), outlook_factory=Outlook,
+        )
+        assert Outlook.read_items == ["entry-1"]
+        assert db.task_email(1)["task_status"] == "dismissed"
+        assert "marked dismissed" in telegram.messages[0]
+    finally:
+        db.close()
+
+
+def test_done_validates_all_ids_before_any_change(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    try:
+        _seed_task(db)
+        process_updates(
+            db, configured, telegram, [_update(22, "/done #1 #999")],
+            logging.getLogger(), outlook_factory=Outlook,
+        )
+        assert Outlook.read_calls == 0
+        assert db.task_email(1)["task_status"] == "open"
+        assert "No emails were changed" in telegram.messages[0]
+    finally:
+        db.close()
+
+
+def test_done_keeps_completed_prefix_when_later_outlook_item_fails(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    try:
+        _seed_task(db, "entry-1", "First")
+        _seed_task(db, "entry-2", "Second")
+        _seed_task(db, "entry-3", "Third")
+        Outlook.fail_on = "entry-2"
+        process_updates(
+            db, configured, telegram, [_update(23, "/done #1 #2 #3")],
+            logging.getLogger(), outlook_factory=Outlook,
+        )
+        statuses = {row["id"]: row["status"] for row in db.list_tasks()}
+        assert statuses == {1: "done", 2: "open", 3: "open"}
+        assert db.telegram_update_task_ids(23, status="applied") == [1]
+        assert "after 1 of 3 tasks completed" in telegram.messages[0]
+        assert "Resending the command is safe" in telegram.messages[0]
+    finally:
+        db.close()
+
+
+def test_done_response_retry_does_not_repeat_applied_actions(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    try:
+        _seed_task(db)
+        update = _update(24, "/done #1")
+        with pytest.raises(TelegramError):
+            process_updates(
+                db, configured, Telegram(fail=True), [update], logging.getLogger(),
+                outlook_factory=Outlook,
+            )
+        assert db.task_email(1)["task_status"] == "done"
+        assert db.telegram_update(24)["status"] == "applied"
+        process_updates(
+            db, configured, Telegram(), [update], logging.getLogger(), outlook_factory=Outlook,
+        )
+        assert Outlook.read_calls == 1
+    finally:
+        db.close()
+
+
+def test_done_reports_local_task_update_failure_via_telegram(monkeypatch, settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    try:
+        _seed_task(db)
+        monkeypatch.setattr(
+            db, "apply_telegram_task",
+            lambda *args, **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database busy")),
+        )
+        process_updates(
+            db, configured, telegram, [_update(25, "/done #1")],
+            logging.getLogger(), outlook_factory=Outlook,
+        )
+        assert Outlook.read_items == ["entry-1"]
+        assert db.task_email(1)["task_status"] == "open"
+        assert "local task status could not be updated" in telegram.messages[0]
+        assert db.telegram_update(25)["error_category"] == "database"
     finally:
         db.close()
 

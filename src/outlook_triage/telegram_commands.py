@@ -8,6 +8,8 @@ from dataclasses import dataclass
 HELP_TEXT = (
     "Available commands:\n"
     "/read #<task-id> [#<task-id> ...] — mark one or more original Outlook emails as read\n"
+    "/done #<task-id> [#<task-id> ...] — mark emails read and tasks done\n"
+    "/dismiss #<task-id> [#<task-id> ...] — mark emails read and tasks dismissed\n"
     "/show #<task-id> — show a bounded preview without changing read state\n"
     "/help — show this message"
 )
@@ -24,7 +26,7 @@ class TelegramCommand:
 
 
 _COMMAND_RE = re.compile(
-    r"^/(?P<action>read|show|help|start)(?:@[A-Za-z0-9_]+)?(?:\s+(?P<arguments>.+?))?\s*$",
+    r"^/(?P<action>read|done|dismiss|show|help|start)(?:@[A-Za-z0-9_]+)?(?:\s+(?P<arguments>.+?))?\s*$",
     re.IGNORECASE,
 )
 
