@@ -160,6 +160,16 @@ def test_webhook_info_returns_mapping():
     assert TelegramClient("secret", session=session).webhook_info() == {"url": ""}
 
 
+def test_set_commands_registers_telegram_menu():
+    session = Session([Response()])
+    TelegramClient("secret", session=session).set_commands((("list", "Show digest"), ("help", "Show help")))
+    assert session.calls[0][0].endswith("/setMyCommands")
+    assert session.calls[0][1]["commands"] == (
+        '[{"command": "list", "description": "Show digest"}, '
+        '{"command": "help", "description": "Show help"}]'
+    )
+
+
 def test_send_digest_delivers_chunks_in_order():
     chunks = format_digest("# One\n\n" + ("x" * 3500))
     session = Session([Response() for _ in chunks])

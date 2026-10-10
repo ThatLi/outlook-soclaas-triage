@@ -1,4 +1,4 @@
-from outlook_triage.telegram_commands import format_body_preview, parse_command
+from outlook_triage.telegram_commands import BOT_COMMANDS, format_body_preview, parse_command
 
 
 def test_parse_supported_commands_and_bot_suffixes():
@@ -12,12 +12,23 @@ def test_parse_supported_commands_and_bot_suffixes():
     assert parse_command("/show@triage_bot #7").task_id == 7
     assert parse_command("/start").action == "help"
     assert parse_command("/help").action == "help"
+    assert parse_command("/list").action == "list"
+    assert parse_command("/sync@triage_bot").action == "sync"
+    assert parse_command("/status").action == "status"
+    assert parse_command("/retry").limit == 50
+    assert parse_command("/retry 100").limit == 100
+    assert parse_command("/tasks").option == "all"
+    assert parse_command("/tasks WAITING").option == "waiting"
+    assert parse_command("/waiting #4 5 #4").task_ids == (4, 5)
+    assert parse_command("/reopen 8").task_ids == (8,)
+    assert {command for command, _ in BOT_COMMANDS} >= {"list", "sync", "retry", "tasks"}
 
 
 def test_parse_rejects_malformed_commands():
     for value in (
         "read 1", "/read", "/read #0", "/read -1", "/help now", "/delete #1",
-        "/show #1 #2", "/done", "/dismiss #0",
+        "/show #1 #2", "/done", "/dismiss #0", "/list now", "/sync now",
+        "/status now", "/retry 0", "/retry 101", "/retry many", "/tasks unknown",
     ):
         assert parse_command(value) is None
 

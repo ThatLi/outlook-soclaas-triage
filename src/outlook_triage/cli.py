@@ -20,6 +20,7 @@ from .soclaas import SoCLaaSClient
 from .telegram import TelegramClient, TelegramError
 from .telegram_delivery import deliver_pending, enqueue_digest
 from .telegram_inbound import ensure_polling_available, listen, poll_once
+from .telegram_commands import BOT_COMMANDS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -243,6 +244,7 @@ def run(args: argparse.Namespace) -> int:
                     processed = poll_once(db, settings, telegram, logger, timeout=0)
                     print(f"Telegram poll complete: processed={processed}")
                 else:
+                    telegram.set_commands(BOT_COMMANDS)
                     print("Telegram command listener started. Press Ctrl+C to stop.")
                     listen(db, settings, telegram, logger)
             return 0

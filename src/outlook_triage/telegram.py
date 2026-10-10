@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import random
 import re
 import time
@@ -491,6 +492,10 @@ class TelegramClient:
     def webhook_info(self) -> dict[str, Any]:
         result = self._request("getWebhookInfo")
         return result if isinstance(result, dict) else {}
+
+    def set_commands(self, commands: tuple[tuple[str, str], ...]) -> None:
+        payload = [{"command": command, "description": description} for command, description in commands]
+        self._request("setMyCommands", {"commands": json.dumps(payload, ensure_ascii=False)})
 
     def send_message(self, text: str, *, chat_id: str | None = None, parse_mode: str | None = "HTML") -> None:
         target = chat_id or self.chat_id
