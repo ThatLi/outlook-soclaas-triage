@@ -16,10 +16,22 @@ SGT = ZoneInfo("Asia/Singapore")
 
 
 class Item:
-    def __init__(self, entry_id, received, *, body="Body", message_class="IPM.Note", sender_type="SMTP"):
+    def __init__(
+        self,
+        entry_id,
+        received,
+        *,
+        body="Body",
+        message_class="IPM.Note",
+        sender_type="SMTP",
+        unread=True,
+        flag_status=0,
+    ):
         self.EntryID = entry_id
         self.ReceivedTime = received
         self.MessageClass = message_class
+        self.UnRead = unread
+        self.FlagStatus = flag_status
         self.Subject = f"Subject {entry_id}"
         self.SenderName = "Alice"
         self.SenderEmailType = sender_type
@@ -114,6 +126,42 @@ def test_sync_uses_overlap_cutoff_and_high_water():
     assert [message["sourceId"] for message in result.messages] == ["new", "overlap"]
     assert result.high_water_received_at == "2026-10-02T10:00:00+08:00"
     assert namespace.inbox.Items.sorted == ("[ReceivedTime]", True)
+
+
+def test_sync_includes_unread_or_actively_flagged_messages_only():
+    items = [
+        Item("unread", datetime(2026, 10, 2, 11, 0, tzinfo=SGT), unread=True),
+        Item("flagged", datetime(2026, 10, 2, 10, 0, tzinfo=SGT), unread=False, flag_status=2),
+        Item("read", datetime(2026, 10, 2, 9, 0, tzinfo=SGT), unread=False),
+        Item("completed", datetime(2026, 10, 2, 8, 0, tzinfo=SGT), unread=False, flag_status=1),
+    ]
+    client, _, _ = make_client(items)
+    with client:
+        result = client.sync("2026-10-02T07:00:00+08:00", overlap_hours=0)
+    assert [message["sourceId"] for message in result.messages] == ["unread", "flagged"]
+    assert items[0].body_reads == 1
+    assert items[1].body_reads == 1
+    assert items[2].body_reads == 0
+    assert items[3].body_reads == 0
+
+
+def test_sync_advances_high_water_for_excluded_message():
+    read = Item("read", datetime(2026, 10, 2, 10, 0, tzinfo=SGT), unread=False)
+    client, _, _ = make_client([read])
+    with client:
+        result = client.sync("2026-10-02T09:00:00+08:00", overlap_hours=0)
+    assert result.messages == []
+    assert result.high_water_received_at == "2026-10-02T10:00:00+08:00"
+    assert read.body_reads == 0
+
+
+def test_get_message_ignores_sync_eligibility_for_explicit_fetches():
+    read = Item("read", datetime(2026, 10, 2, 8, 0, tzinfo=SGT), unread=False)
+    client, _, _ = make_client([read])
+    with client:
+        message = client.get_message("read")
+    assert message["sourceId"] == "read"
+    assert read.body_reads == 1
 
 
 def test_exchange_sender_and_refetch():
@@ -253,5 +301,5 @@ def test_malformed_items_are_skipped_during_sync():
     with client:
         result = client.sync("2026-10-02T07:00:00+08:00", overlap_hours=0)
     assert [message["sourceId"] for message in result.messages] == ["valid"]
-    assert result.high_water_received_at == "2026-10-02T08:00:00+08:00"
+    assert result.high_water_received_at == "2026-10-02T09:00:00+08:00"
 
