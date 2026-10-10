@@ -5,6 +5,10 @@ def test_parse_supported_commands_and_bot_suffixes():
     assert parse_command("/read #42").action == "read"
     assert parse_command("/read 42").task_id == 42
     assert parse_command("/read #42 7 #42 9").task_ids == (42, 7, 9)
+    assert parse_command("/done #42 7 #42 9").task_ids == (42, 7, 9)
+    assert parse_command("/done #42").action == "done"
+    assert parse_command("/dismiss@triage_bot 7 #9").task_ids == (7, 9)
+    assert parse_command("/dismiss #42").action == "dismiss"
     assert parse_command("/show@triage_bot #7").task_id == 7
     assert parse_command("/start").action == "help"
     assert parse_command("/help").action == "help"
@@ -13,7 +17,7 @@ def test_parse_supported_commands_and_bot_suffixes():
 def test_parse_rejects_malformed_commands():
     for value in (
         "read 1", "/read", "/read #0", "/read -1", "/help now", "/delete #1",
-        "/show #1 #2",
+        "/show #1 #2", "/done", "/dismiss #0",
     ):
         assert parse_command(value) is None
 
