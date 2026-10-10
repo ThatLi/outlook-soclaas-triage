@@ -199,6 +199,37 @@ class OutlookClient:
             raise OutlookError("The selected Outlook item is not a supported mail or meeting message")
         return normalized
 
+    def mark_read(self, source_id: str, store_id: str | None = None) -> bool:
+        """Mark a supported Outlook item read and return whether it changed."""
+        try:
+            item = self.namespace.GetItemFromID(source_id, store_id or self.store_id)
+            message_class = str(_safe_get(item, "MessageClass", "") or "")
+            if not message_class.startswith(SUPPORTED_MESSAGE_PREFIXES):
+                raise OutlookError("The selected Outlook item is not a supported mail or meeting message")
+            if not bool(_safe_get(item, "UnRead", False)):
+                return False
+            item.UnRead = False
+            item.Save()
+            return True
+        except OutlookError:
+            raise
+        except Exception as exc:
+            raise self._translate_error("mark the selected Outlook message as read", exc) from exc
+
+    def get_body_preview(self, source_id: str, store_id: str | None = None, *, limit: int = 6000) -> str:
+        """Read a bounded plain-text body without changing the item's read state."""
+        try:
+            item = self.namespace.GetItemFromID(source_id, store_id or self.store_id)
+            message_class = str(_safe_get(item, "MessageClass", "") or "")
+            if not message_class.startswith(SUPPORTED_MESSAGE_PREFIXES):
+                raise OutlookError("The selected Outlook item is not a supported mail or meeting message")
+            body = str(_safe_get(item, "Body", "") or "")
+        except OutlookError:
+            raise
+        except Exception as exc:
+            raise self._translate_error("read the selected Outlook message body", exc) from exc
+        return body[: max(0, limit)]
+
     def sync(
         self,
         last_received_at: str | None,

@@ -41,6 +41,7 @@ class Item:
         self.Attachments = SimpleNamespace(Count=0)
         self._body = body
         self.body_reads = 0
+        self.save_calls = 0
         if sender_type == "EX":
             self.Sender = SimpleNamespace(
                 GetExchangeUser=lambda: SimpleNamespace(PrimarySmtpAddress="alice@company.test"),
@@ -51,6 +52,9 @@ class Item:
     def Body(self):
         self.body_reads += 1
         return self._body
+
+    def Save(self):
+        self.save_calls += 1
 
 
 class Items:
@@ -162,6 +166,26 @@ def test_get_message_ignores_sync_eligibility_for_explicit_fetches():
         message = client.get_message("read")
     assert message["sourceId"] == "read"
     assert read.body_reads == 1
+
+
+def test_mark_read_changes_and_saves_unread_item_idempotently():
+    item = Item("entry-1", datetime(2026, 10, 2, 8, 0, tzinfo=SGT), unread=True)
+    client, _, _ = make_client([item])
+    with client:
+        assert client.mark_read("entry-1", "store-1") is True
+        assert item.UnRead is False
+        assert item.save_calls == 1
+        assert client.mark_read("entry-1", "store-1") is False
+        assert item.save_calls == 1
+
+
+def test_body_preview_is_bounded_and_does_not_change_read_state():
+    item = Item("entry-1", datetime(2026, 10, 2, 8, 0, tzinfo=SGT), body="abcdef", unread=True)
+    client, _, _ = make_client([item])
+    with client:
+        assert client.get_body_preview("entry-1", "store-1", limit=3) == "abc"
+    assert item.UnRead is True
+    assert item.save_calls == 0
 
 
 def test_exchange_sender_and_refetch():

@@ -27,5 +27,6 @@ def settings(tmp_path: Path) -> Settings:
         reports_dir=tmp_path / "data" / "reports",
         log_file=tmp_path / "state" / "app.log",
         lock_dir=tmp_path / "state" / "sync.lock",
+        telegram_body_preview_chars=6000,
     )
 

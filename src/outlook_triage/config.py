@@ -44,6 +44,7 @@ class Settings:
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     telegram_timeout_seconds: float = 20.0
+    telegram_body_preview_chars: int = 6000
 
     def require_telegram(self, *, require_chat: bool = True) -> None:
         missing: list[str] = []
@@ -94,6 +95,7 @@ def load_settings() -> Settings:
         telegram_bot_token=value("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=value("TELEGRAM_CHAT_ID"),
         telegram_timeout_seconds=float(value("TELEGRAM_TIMEOUT_SECONDS", "20") or 20),
+        telegram_body_preview_chars=int(value("TELEGRAM_BODY_PREVIEW_CHARS", "6000") or 6000),
         soclaas_base_url=(value("SOCLAAS_BASE_URL", "https://soclaas-api.comp.nus.edu.sg/v1") or "").rstrip("/"),
         model=value("EMAIL_TRIAGE_MODEL"),
         timezone_name=timezone_name,

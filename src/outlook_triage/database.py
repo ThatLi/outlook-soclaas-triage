@@ -212,6 +212,15 @@ class Database:
         self.connection.commit()
         return cursor.rowcount == 1
 
+    def task_email(self, task_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """SELECT tasks.id AS task_id, tasks.status AS task_status,
+                      emails.source_id, emails.store_id, emails.subject
+               FROM tasks JOIN emails ON emails.message_key=tasks.email_message_key
+               WHERE tasks.id=?""",
+            (task_id,),
+        ).fetchone()
+
     def digest_snapshot(self, since: str) -> dict:
         counts = self.connection.execute(
             """SELECT
