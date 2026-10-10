@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 
 OL_FOLDER_INBOX = 6
+OL_FLAG_MARKED = 2
 SUPPORTED_MESSAGE_PREFIXES = ("IPM.Note", "IPM.Schedule.Meeting")
 
 
@@ -169,6 +170,12 @@ class OutlookClient:
         except Exception as exc:
             raise self._translate_error("enumerate Inbox messages", exc) from exc
 
+    @staticmethod
+    def _is_sync_eligible(item: Any) -> bool:
+        unread = bool(_safe_get(item, "UnRead", False))
+        flag_status = int(_safe_get(item, "FlagStatus", 0) or 0)
+        return unread or flag_status == OL_FLAG_MARKED
+
     def newest_messages(self, limit: int = 10) -> list[dict]:
         messages: list[dict] = []
         for item in self._iter_sorted():
@@ -211,6 +218,14 @@ class OutlookClient:
                 continue
             if received < cutoff:
                 break
+            if high_water is None or received > high_water:
+                high_water = received
+            try:
+                eligible = self._is_sync_eligible(item)
+            except (TypeError, ValueError):
+                continue
+            if not eligible:
+                continue
             try:
                 normalized = self._normalize(item, include_body=True)
             except (OutlookError, TypeError, ValueError):
@@ -218,7 +233,5 @@ class OutlookClient:
             if not normalized:
                 continue
             messages.append(normalized)
-            if high_water is None or received > high_water:
-                high_water = received
         return SyncResult(messages, (high_water or now).isoformat(timespec="seconds"))
 

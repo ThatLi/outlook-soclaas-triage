@@ -94,7 +94,9 @@ Matches are case-insensitive and subject patterns are regular expressions. The a
 
 ## 5. Run synchronization and task management
 
-The first synchronization scans the previous seven days. Later runs scan from the last high-water timestamp with an eight-hour overlap and deduplicate by Outlook store ID and EntryID.
+The first synchronization considers messages received during the previous seven days. Later runs consider messages from the last high-water timestamp with an eight-hour overlap and deduplicate by Outlook store ID and EntryID. Within that window, synchronization reads and classifies messages that are unread or have an active follow-up flag. Read messages without an active flag, including messages whose flags are completed, are skipped without reading their bodies.
+
+Pinned messages are not included unless they are also unread or actively flagged. Classic Outlook's documented object model does not expose pin state, so the application does not attempt to infer it from unsupported properties.
 
 ```powershell
 outlook-triage sync
