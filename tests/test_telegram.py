@@ -145,6 +145,15 @@ def test_recent_private_chats_deduplicates_and_ignores_groups():
     assert [(chat.chat_id, chat.display_name) for chat in chats] == [("7", "A")]
 
 
+def test_get_updates_sends_offset_timeout_and_message_filter():
+    session = Session([Response(payload={"ok": True, "result": [{"update_id": 9}]})])
+    updates = TelegramClient("secret", session=session).get_updates(offset=9, timeout=30)
+    assert updates == [{"update_id": 9}]
+    assert session.calls[0][1] == {
+        "offset": 9, "timeout": 30, "allowed_updates": '["message"]'
+    }
+
+
 def test_send_digest_delivers_chunks_in_order():
     chunks = format_digest("# One\n\n" + ("x" * 3500))
     session = Session([Response() for _ in chunks])

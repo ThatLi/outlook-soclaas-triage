@@ -468,6 +468,16 @@ class TelegramClient:
             chats[chat_id] = TelegramChat(chat_id, name, "private")
         return list(chats.values())
 
+    def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, Any]]:
+        data: dict[str, Any] = {
+            "timeout": max(0, timeout),
+            "allowed_updates": '["message"]',
+        }
+        if offset is not None:
+            data["offset"] = offset
+        result = self._request("getUpdates", data)
+        return [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+
     def send_message(self, text: str, *, chat_id: str | None = None, parse_mode: str | None = "HTML") -> None:
         target = chat_id or self.chat_id
         if not target:

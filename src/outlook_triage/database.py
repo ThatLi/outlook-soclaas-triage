@@ -67,6 +67,21 @@ CREATE TABLE IF NOT EXISTS telegram_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_telegram_deliveries_status_created
     ON telegram_deliveries(status, created_at, id);
+CREATE TABLE IF NOT EXISTS telegram_updates (
+    update_id INTEGER PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    command TEXT NOT NULL,
+    task_id INTEGER,
+    status TEXT NOT NULL CHECK(status IN ('received','applied','responded','failed')),
+    error_category TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    next_update_id INTEGER
+);
+INSERT OR IGNORE INTO telegram_state(singleton, next_update_id) VALUES (1, NULL);
 """
 
 
@@ -221,6 +236,43 @@ class Database:
             (task_id,),
         ).fetchone()
 
+    def telegram_offset(self) -> int | None:
+        row = self.connection.execute(
+            "SELECT next_update_id FROM telegram_state WHERE singleton=1"
+        ).fetchone()
+        return int(row["next_update_id"]) if row and row["next_update_id"] is not None else None
+
+    def set_telegram_offset(self, next_update_id: int) -> None:
+        self.connection.execute(
+            "UPDATE telegram_state SET next_update_id=? WHERE singleton=1", (next_update_id,)
+        )
+        self.connection.commit()
+
+    def telegram_update(self, update_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM telegram_updates WHERE update_id=?", (update_id,)
+        ).fetchone()
+
+    def record_telegram_update(self, update_id: int, chat_id: str, command: str, task_id: int | None) -> None:
+        now = local_now()
+        self.connection.execute(
+            """INSERT OR IGNORE INTO telegram_updates(
+                   update_id, chat_id, command, task_id, status, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, 'received', ?, ?)""",
+            (update_id, chat_id, command, task_id, now, now),
+        )
+        self.connection.commit()
+
+    def set_telegram_update_status(
+        self, update_id: int, status: str, *, error_category: str | None = None
+    ) -> None:
+        self.connection.execute(
+            """UPDATE telegram_updates SET status=?, error_category=?, updated_at=?
+               WHERE update_id=?""",
+            (status, error_category, local_now(), update_id),
+        )
+        self.connection.commit()
+
     def digest_snapshot(self, since: str) -> dict:
         counts = self.connection.execute(
             """SELECT
@@ -369,7 +421,10 @@ class Database:
 
     def export_debug_schema(self) -> dict:
         result = {}
-        for table in ("emails", "tasks", "sync_state", "runs", "telegram_deliveries"):
+        for table in (
+            "emails", "tasks", "sync_state", "runs", "telegram_deliveries",
+            "telegram_updates", "telegram_state",
+        ):
             rows = self.connection.execute(f"PRAGMA table_info({table})").fetchall()
             result[table] = [row["name"] for row in rows]
         return json.loads(json.dumps(result))
