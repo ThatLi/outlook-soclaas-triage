@@ -344,6 +344,27 @@ class Database:
                 "last_sync": sync["last_success_at"] if sync else None,
                 "last_run": dict(last_run) if last_run else None}
 
+    def operational_status(self) -> dict:
+        sync = self.connection.execute(
+            "SELECT last_success_at FROM sync_state WHERE mailbox='inbox'"
+        ).fetchone()
+        last_run = self.connection.execute(
+            "SELECT status, finished_at FROM runs WHERE run_type='sync' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        classification = self.connection.execute(
+            """SELECT COUNT(*) AS count FROM emails
+               WHERE processing_status IN ('pending','failed')"""
+        ).fetchone()
+        task_rows = self.connection.execute(
+            "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
+        ).fetchall()
+        return {
+            "last_sync": sync["last_success_at"] if sync else None,
+            "last_run": dict(last_run) if last_run else None,
+            "pending_or_failed": int(classification["count"]) if classification else 0,
+            "task_counts": {str(row["status"]): int(row["count"]) for row in task_rows},
+        }
+
     def active_telegram_delivery(self, digest_date: str) -> sqlite3.Row | None:
         return self.connection.execute(
             """SELECT * FROM telegram_deliveries

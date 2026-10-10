@@ -187,21 +187,32 @@ Checks once for inbound commands, processes them in update order, prints the num
 outlook-triage telegram-listen
 ```
 
-Runs a foreground long-polling listener until interrupted. It uses outbound HTTPS only and does not expose a local HTTP server. Transient Telegram failures use bounded backoff. Run only one listener; a receiver lock prevents this command, `telegram-poll`, and `telegram-chats` from consuming updates concurrently.
+Runs a foreground long-polling listener until interrupted. It uses outbound HTTPS only and does not expose a local HTTP server. Transient Telegram failures use bounded backoff. Run only one listener; a receiver lock prevents this command, `telegram-poll`, and `telegram-chats` from consuming updates concurrently. At startup, the listener registers the supported commands in Telegram's bot command menu.
 
 The configured private chat supports:
 
 | Command | Behavior |
 | --- | --- |
+| `/list` | Immediately acknowledges the request, synchronizes Outlook and runs classification, reports counts, then sends a freshly generated digest from current SQLite state. It does not save a report or create/reuse a Telegram outbox delivery. If some classifications fail, it still sends the counts, warning, and available digest. |
+| `/sync` | Immediately acknowledges the request, synchronizes Outlook and runs classification, then reports counts without sending a digest. |
+| `/retry` or `/retry 25` | Immediately acknowledges the request and retries up to 50, or the specified 1–100, pending or failed classifications. |
+| `/status` | Shows the last successful sync, latest run state, pending/failed classification count, and task counts by status from SQLite without contacting Outlook. |
+| `/tasks`, `/tasks open`, `/tasks waiting`, `/tasks done`, `/tasks dismissed`, or `/tasks all` | Lists escaped, bounded task messages from SQLite. The default is `all`; Outlook is not contacted. |
 | `/read #42` or `/read #42 #51 68` | Marks one or more tasks' original Outlook emails read. IDs are deduplicated, every ID is validated before any email changes, and local task statuses remain unchanged. Repeating the command is safe. |
 | `/done #42` or `/done #42 #51 68` | Marks each original email read and then sets each local task to `done`. |
 | `/dismiss #42` or `/dismiss #42 #51 68` | Marks each original email read and then sets each local task to `dismissed`. |
+| `/waiting #42` or `/waiting #42 #51 68` | Sets each local task to `waiting` without changing Outlook read state. |
+| `/reopen #42` or `/reopen #42 #51 68` | Sets each local task to `open` without changing Outlook read state. |
 | `/show #42` | Sends a bounded, escaped plain-text body preview without changing Outlook read state. Attachment contents are never read. |
 | `/help` or `/start` | Shows the available commands. |
 
-Task IDs are the numeric IDs shown in the digest and `tasks list`. Batch commands deduplicate IDs and validate the entire list before making changes. For `/done` and `/dismiss`, each local status changes only after that task's Outlook email is successfully marked read; successfully completed earlier items remain changed if a later Outlook operation fails. The bot reports validation, lock, Outlook, and local task-update failures with sanitized retry guidance. Resending a failed command is safe.
+Task IDs are the numeric IDs shown in the digest and task lists. Batch commands deduplicate IDs and validate the entire list before making changes. For `/done` and `/dismiss`, each local status changes only after that task's Outlook email is successfully marked read; successfully completed earlier items remain changed if a later Outlook operation fails. `/waiting` and `/reopen` are idempotent local-only transitions. The bot reports validation, lock, configuration, Outlook, SoCLaaS, database, and other operational failures with sanitized retry guidance.
 
-Commands from other chats and bot-authored messages are ignored. The listener briefly acquires the synchronization lock for Outlook access, so synchronization and Telegram commands cannot use Outlook concurrently. Tasks in `done` or `dismissed` state are omitted from subsequent digests; marking an email read with `/read` alone does not change its local task or remove it from the digest.
+Commands from other chats and bot-authored messages are ignored. `/list`, `/sync`, and `/retry` occupy the listener while they run, so their immediate acknowledgement confirms that work started. Outlook operations share the synchronization lock, preventing concurrent Outlook access. An update is recorded as applied before its final response is sent; if Telegram delivery fails, retrying the update sends a safe response without repeating synchronization, classification, or task mutations.
+
+`/list` always means synchronize first and then generate a live digest. Use `/tasks` or `/status` for a fast database-only view. Tasks in `done` or `dismissed` state are omitted from subsequent digests; marking an email read with `/read` alone does not change its local task or remove it from the digest.
+
+Installation, credentials, model selection, `init`, `models`, `check-mail`, `classify-one`, Telegram setup/recovery, raw Outlook-ID diagnostics, and Windows Task Scheduler registration remain local-only administration. The Telegram interface is for daily operations, not remote host administration.
 
 ## Telegram delivery
 
@@ -312,7 +323,7 @@ Advanced path overrides are available as process environment variables:
 | `OUTLOOK_TRIAGE_LOG_FILE` | `%LOCALAPPDATA%\OutlookTriage\logs\outlook-triage.log` |
 | `OUTLOOK_TRIAGE_LOCK_DIR` | `%LOCALAPPDATA%\OutlookTriage\state\sync.lock` |
 
-The SQLite database contains discovered message metadata, classifications, local tasks, run history, pending Telegram chunks, the inbound update offset, and a minimal command audit. The audit stores command type, task ID, state, authorized chat ID, and sanitized error category; it does not store raw command text, email bodies, or Outlook identifiers. Reports are Markdown files. Logs rotate and exclude message bodies, API keys, and full Outlook `EntryID` values.
+The SQLite database contains discovered message metadata, classifications, local tasks, run history, pending Telegram chunks, the inbound update offset, and a minimal command audit. The audit stores command type, referenced task IDs, state, authorized chat ID, and sanitized error category; it does not store raw command text, email bodies, or Outlook identifiers. Retry arguments and task filters are also excluded. Reports are Markdown files. Logs rotate and exclude message bodies, API keys, full Outlook `EntryID` values, and arbitrary Telegram command text.
 
 ## Filtering behavior
 
@@ -355,6 +366,7 @@ Common failures behave as follows:
 - **Telegram listener reports a webhook conflict:** clear the bot's webhook before using long polling; Telegram does not permit both receivers simultaneously.
 - **Telegram listener says another receiver is active:** stop the other listener or wait for `telegram-poll`/`telegram-chats` to finish. Investigate the receiver lock only after confirming no listener process is active.
 - **A Telegram Outlook command fails:** confirm classic Outlook is open and responsive under the scheduled task's interactive Windows user, then retry the command.
+- **A Telegram `/list`, `/sync`, or `/retry` command fails:** follow the sanitized reply, inspect the local log for operational detail, correct the local configuration/service problem, and resend. A transport retry after the operation was applied will not repeat the work.
 - **A batch command partially completes:** the bot reports how many tasks completed. Those task changes are retained; remaining task statuses are unchanged, and resending the complete command is safe.
 
 Use the global verbose option for interactive diagnosis:

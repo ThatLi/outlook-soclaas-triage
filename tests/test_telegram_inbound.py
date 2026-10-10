@@ -8,13 +8,21 @@ from types import SimpleNamespace
 import pytest
 
 from outlook_triage.database import Database
+from outlook_triage.config import ConfigurationError
+from outlook_triage.locking import AlreadyRunning
 from outlook_triage.models import EmailClassification
 from outlook_triage.outlook import OutlookUnavailable
 from outlook_triage.telegram import TelegramError
+import outlook_triage.telegram_inbound as telegram_inbound
 from outlook_triage.telegram_inbound import ensure_polling_available, listen, poll_once, process_updates
 
 
-def _seed_task(db: Database, source_id: str = "entry-1", subject: str = "Private <report>") -> None:
+def _seed_task(
+    db: Database,
+    source_id: str = "entry-1",
+    subject: str = "Private <report>",
+    task_description: str = "Review it",
+) -> None:
     db.store_sync_batch(
         [{
             "messageKey": f"store-1:{source_id}", "sourceId": source_id, "storeId": "store-1",
@@ -27,7 +35,7 @@ def _seed_task(db: Database, source_id: str = "entry-1", subject: str = "Private
         f"store-1:{source_id}",
         EmailClassification.model_validate({
             "requires_action": True, "urgency": "normal", "action_type": "other",
-            "task": "Review it", "deadline": None, "deadline_raw": None,
+            "task": task_description, "deadline": None, "deadline_raw": None,
             "summary": "Summary", "category": "action", "reason": "Requested", "confidence": 1,
         }),
         "model",
@@ -278,6 +286,144 @@ def test_done_reports_local_task_update_failure_via_telegram(monkeypatch, settin
         assert db.task_email(1)["task_status"] == "open"
         assert "local task status could not be updated" in telegram.messages[0]
         assert db.telegram_update(25)["error_category"] == "database"
+    finally:
+        db.close()
+
+
+def test_waiting_and_reopen_update_local_state_without_outlook(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+
+    class NoOutlook:
+        def __init__(self, *args, **kwargs):
+            pytest.fail("Outlook must not be accessed")
+
+    try:
+        _seed_task(db, "entry-1", "First")
+        _seed_task(db, "entry-2", "Second")
+        process_updates(
+            db, configured, telegram, [_update(30, "/waiting #1 #2 #1")],
+            logging.getLogger(), outlook_factory=NoOutlook,
+        )
+        assert [row["status"] for row in db.list_tasks()] == ["waiting", "waiting"]
+        process_updates(
+            db, configured, telegram, [_update(31, "/reopen #1 #2")],
+            logging.getLogger(), outlook_factory=NoOutlook,
+        )
+        assert [row["status"] for row in db.list_tasks()] == ["open", "open"]
+        assert "2 tasks marked waiting" in telegram.messages[0]
+        assert "2 tasks marked open" in telegram.messages[1]
+    finally:
+        db.close()
+
+
+def test_tasks_filter_and_status_use_database_only(settings):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+
+    class NoOutlook:
+        def __init__(self, *args, **kwargs):
+            pytest.fail("Outlook must not be accessed")
+
+    try:
+        _seed_task(db, "entry-1", task_description="Open <task>")
+        _seed_task(db, "entry-2", "Done task")
+        db.set_task_status(2, "done")
+        process_updates(
+            db, configured, telegram, [_update(32, "/tasks open"), _update(33, "/status")],
+            logging.getLogger(), outlook_factory=NoOutlook,
+        )
+        assert "Open &lt;task&gt;" in telegram.messages[0]
+        assert "Done task" not in telegram.messages[0]
+        assert "TRIAGE STATUS" in telegram.messages[1]
+        assert "Open: <b>1</b>" in telegram.messages[1]
+        assert "Done: <b>1</b>" in telegram.messages[1]
+    finally:
+        db.close()
+
+
+def test_list_synchronizes_before_live_digest_without_report_or_outbox(settings, monkeypatch):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+    calls = []
+
+    def sync_runner(active_db, active_settings, logger):
+        calls.append("sync")
+        _seed_task(active_db, task_description="Added by synchronization")
+        return {"processed": 1, "skipped": 0, "failed": 1, "unchanged": 0}
+
+    monkeypatch.setattr(telegram_inbound, "run_sync", sync_runner)
+    try:
+        process_updates(db, configured, telegram, [_update(40, "/list")], logging.getLogger())
+        assert calls == ["sync"]
+        assert telegram.messages[0].startswith("⏳")
+        assert "processed=1" in telegram.messages[1]
+        assert "digest may be incomplete" in telegram.messages[1]
+        assert any("Added by synchronization" in message for message in telegram.messages[2:])
+        assert not settings.reports_dir.exists()
+        count = db.connection.execute("SELECT COUNT(*) FROM telegram_deliveries").fetchone()[0]
+        assert count == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(("text", "runner_name"), [
+    ("/list", "run_sync"),
+    ("/sync", "run_sync"),
+    ("/retry 12", "run_retry"),
+])
+def test_operation_response_retry_does_not_repeat_work(settings, monkeypatch, text, runner_name):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    calls = []
+
+    def runner(*args, **kwargs):
+        calls.append(kwargs.get("limit"))
+        return {"processed": 2, "skipped": 0, "failed": 0, "unchanged": 0}
+
+    class FailFinal(Telegram):
+        def send_message(self, text, **kwargs):
+            if self.messages:
+                raise TelegramError("offline", category="transient")
+            super().send_message(text, **kwargs)
+
+    monkeypatch.setattr(telegram_inbound, runner_name, runner)
+    try:
+        with pytest.raises(TelegramError):
+            process_updates(db, configured, FailFinal(), [_update(41, text)], logging.getLogger())
+        assert db.telegram_update(41)["status"] == "applied"
+        retry_telegram = Telegram()
+        process_updates(db, configured, retry_telegram, [_update(41, text)], logging.getLogger())
+        assert len(calls) == 1
+        assert "already completed" in retry_telegram.messages[0]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(("error", "expected"), [
+    (AlreadyRunning("secret lock path"), "busy"),
+    (ConfigurationError("secret token"), "configuration"),
+    (OutlookUnavailable("secret Outlook id"), "Outlook"),
+    (sqlite3.OperationalError("secret database path"), "database"),
+    (RuntimeError("secret service response"), "classification service"),
+])
+def test_operation_failures_return_sanitized_messages(settings, monkeypatch, error, expected):
+    configured = replace(settings, telegram_chat_id="7")
+    db = Database(settings.database_file)
+    telegram = Telegram()
+
+    def failing_runner(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(telegram_inbound, "run_sync", failing_runner)
+    try:
+        process_updates(db, configured, telegram, [_update(42, "/sync")], logging.getLogger())
+        assert expected in telegram.messages[-1]
+        assert "secret" not in telegram.messages[-1]
+        assert db.telegram_update(42)["status"] == "failed"
     finally:
         db.close()
 

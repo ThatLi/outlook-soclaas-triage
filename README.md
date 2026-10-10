@@ -1,8 +1,8 @@
 # Outlook–SoCLaaS Triage for Classic Outlook
 
-A local Windows application that reads the signed-in **classic Outlook** profile, filters selected messages, uses SoCLaaS for structured classification, stores metadata and tasks in SQLite, and produces a deterministic Markdown digest. Its scheduled synchronization remains read-only; an explicitly enabled Telegram command listener can mark a selected message read.
+A local Windows application that reads the signed-in **classic Outlook** profile, filters selected messages, uses SoCLaaS for structured classification, stores metadata and tasks in SQLite, and produces a deterministic Markdown digest. Its scheduled synchronization remains read-only; an explicitly enabled Telegram command listener provides the daily sync, digest, retry, task-list, and task-state workflows.
 
-It does not require Microsoft Entra app registration. It never sends, moves, flags, or deletes Outlook messages, and it never reads attachment contents. The only supported Outlook mutation is marking email read through an authorized `/read`, `/done`, or `/dismiss` command from the configured private Telegram chat. Confirm that sending cleaned email text to SoCLaaS—and optional `/show` previews to Telegram—is permitted by your organization.
+It does not require Microsoft Entra app registration. It never sends, moves, flags, or deletes Outlook messages, and it never reads attachment contents. The only supported Outlook mutation is marking email read through an authorized `/read`, `/done`, or `/dismiss` command from the configured private Telegram chat; `/waiting` and `/reopen` change local workflow state only. Confirm that sending cleaned email text to SoCLaaS—and digest or optional `/show` content to Telegram—is permitted by your organization.
 
 For daily operation, the complete command reference, scheduling, Telegram delivery, and troubleshooting, see the [User Guide](docs/User-Guide.md).
 
