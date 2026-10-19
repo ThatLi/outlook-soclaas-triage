@@ -88,6 +88,17 @@ CREATE TABLE IF NOT EXISTS telegram_state (
     next_update_id INTEGER
 );
 INSERT OR IGNORE INTO telegram_state(singleton, next_update_id) VALUES (1, NULL);
+CREATE TABLE IF NOT EXISTS relay_outbox (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    bundle_id TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    intended_date TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','confirmed')),
+    last_attempt_at TEXT,
+    last_error TEXT,
+    confirmed_at TEXT
+);
 """
 
 
@@ -364,6 +375,54 @@ class Database:
             "pending_or_failed": int(classification["count"]) if classification else 0,
             "task_counts": {str(row["status"]): int(row["count"]) for row in task_rows},
         }
+
+    def replace_relay_bundle(self, envelope: dict) -> None:
+        now = local_now()
+        self.connection.execute(
+            """INSERT INTO relay_outbox(
+                   singleton, bundle_id, generated_at, intended_date, envelope_json,
+                   status, last_attempt_at, last_error, confirmed_at
+               ) VALUES (1, ?, ?, ?, ?, 'pending', NULL, NULL, NULL)
+               ON CONFLICT(singleton) DO UPDATE SET
+                   bundle_id=excluded.bundle_id,
+                   generated_at=excluded.generated_at,
+                   intended_date=excluded.intended_date,
+                   envelope_json=excluded.envelope_json,
+                   status='pending', last_attempt_at=NULL, last_error=NULL, confirmed_at=NULL""",
+            (
+                envelope["bundle_id"],
+                envelope["generated_at"],
+                envelope["intended_date"],
+                json.dumps(envelope, separators=(",", ":"), sort_keys=True),
+            ),
+        )
+        self.connection.commit()
+
+    def relay_bundle(self) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM relay_outbox WHERE singleton=1").fetchone()
+
+    def pending_relay_bundle(self) -> dict | None:
+        row = self.connection.execute(
+            "SELECT envelope_json FROM relay_outbox WHERE singleton=1 AND status='pending'"
+        ).fetchone()
+        return json.loads(str(row["envelope_json"])) if row else None
+
+    def mark_relay_attempt_failed(self, message: str) -> None:
+        self.connection.execute(
+            """UPDATE relay_outbox SET status='pending', last_attempt_at=?, last_error=?
+               WHERE singleton=1""",
+            (local_now(), message[:500]),
+        )
+        self.connection.commit()
+
+    def mark_relay_confirmed(self, bundle_id: str) -> None:
+        now = local_now()
+        self.connection.execute(
+            """UPDATE relay_outbox SET status='confirmed', last_attempt_at=?, last_error=NULL,
+                   confirmed_at=? WHERE singleton=1 AND bundle_id=?""",
+            (now, now, bundle_id),
+        )
+        self.connection.commit()
 
     def active_telegram_delivery(self, digest_date: str) -> sqlite3.Row | None:
         return self.connection.execute(
