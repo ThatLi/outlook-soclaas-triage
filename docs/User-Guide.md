@@ -87,8 +87,10 @@ outlook-triage sync
 Scans classic Outlook, stores message metadata, applies explicit filters, classifies eligible messages with SoCLaaS, and creates local tasks for messages requiring action. It prints counts in this form:
 
 ```text
-processed=3 skipped=1 failed=0 unchanged=4
+processed=3 skipped=1 failed=0 unchanged=4 relay_pending=0
 ```
+
+`relay_pending` is `0` when the optional relay is disabled or its newest encrypted snapshot was confirmed, and `1` when relay configuration or upload needs attention. It does not change the synchronization exit status.
 
 On the first run, the scan begins `OUTLOOK_TRIAGE_BOOTSTRAP_DAYS` before the current time. Later runs begin before the stored high-water timestamp by `OUTLOOK_TRIAGE_OVERLAP_HOURS`. Messages are deduplicated by Outlook store ID and `EntryID`.
 
@@ -233,6 +235,21 @@ Queued messages are retained in SQLite for up to seven days and then expire; the
 
 Telegram digest delivery receives summaries, task descriptions, sender information, and deadlines. The `/show` command additionally transmits up to `TELEGRAM_BODY_PREVIEW_CHARS` characters of the original plain-text body. Do not enable these features unless your organization permits that information to be sent to Telegram.
 
+## Optional cloud relay
+
+The phase-one Cloudflare relay lets Telegram deliver the newest locally prepared digest at 08:00 Asia/Singapore even when this Windows device is off. Outlook access, classification, and task state remain local. Each completed `sync` or `retry-failed` replaces the local relay outbox with an encrypted snapshot and attempts to upload it.
+
+The relay is outbound-only. It does not configure a Telegram webhook, so the existing `telegram-listen` command continues to receive commands whenever Windows is running. The encrypted snapshot also includes versioned, pre-rendered `/status`, `/tasks`, and `/list` views for a future two-way extension; phase one does not expose them.
+
+```powershell
+outlook-triage relay-publish
+outlook-triage relay-status
+```
+
+`relay-publish` prepares a fresh snapshot from current SQLite state and uploads it. A failed upload remains pending and is replaced or retried after the next completed synchronization. `relay-status` reports the local outbox and the authenticated cloud delivery state without printing encrypted content.
+
+The cloud delivery always selects the newest uploaded snapshot, regardless of age. If Windows remains off for several days, the same digest is sent each morning with its original preparation and last-sync timestamps. See the [Cloudflare Relay Guide](Cloud-Relay.md) for deployment, security, recovery, and acceptance testing.
+
 ## Windows scheduling
 
 Register schedules only after the manual checks and two consecutive `sync` runs succeed. From the project directory, preview the exact plan without reading or changing Task Scheduler:
@@ -308,6 +325,10 @@ Values in the process environment override values read from `secrets.env`. Blank
 | `TELEGRAM_CHAT_ID` | unset | Optional private destination chat ID. |
 | `TELEGRAM_TIMEOUT_SECONDS` | `20` | Telegram request timeout. |
 | `TELEGRAM_BODY_PREVIEW_CHARS` | `6000` | Maximum original body characters returned by `/show`. |
+| `OUTLOOK_TRIAGE_RELAY_URL` | unset | Cloudflare Worker base URL; setting any relay value requires all three relay credentials. |
+| `OUTLOOK_TRIAGE_RELAY_TOKEN` | unset | Independent bearer secret used only for bundle upload and status requests. |
+| `OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY` | unset | Base64url-encoded 32-byte AES-GCM key shared with the Worker. |
+| `OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS` | `20` | Relay upload and status request timeout. |
 
 Advanced path overrides are available as process environment variables:
 
@@ -366,6 +387,7 @@ Common failures behave as follows:
 - **Telegram listener reports a webhook conflict:** clear the bot's webhook before using long polling; Telegram does not permit both receivers simultaneously.
 - **Telegram listener says another receiver is active:** stop the other listener or wait for `telegram-poll`/`telegram-chats` to finish. Investigate the receiver lock only after confirming no listener process is active.
 - **A Telegram Outlook command fails:** confirm classic Outlook is open and responsive under the scheduled task's interactive Windows user, then retry the command.
+- **Relay publication remains pending:** run `outlook-triage relay-status`, confirm the Worker URL and secrets match, then run `outlook-triage relay-publish`. Outlook synchronization remains committed even when relay upload fails.
 - **A Telegram `/list`, `/sync`, or `/retry` command fails:** follow the sanitized reply, inspect the local log for operational detail, correct the local configuration/service problem, and resend. A transport retry after the operation was applied will not repeat the work.
 - **A batch command partially completes:** the bot reports how many tasks completed. Those task changes are retained; remaining task statuses are unchanged, and resending the complete command is safe.
 
