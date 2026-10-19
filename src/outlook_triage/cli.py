@@ -16,6 +16,7 @@ from .logging_utils import configure_logging
 from .models import EmailForClassification
 from .operations import run_retry, run_sync
 from .outlook import OutlookClient
+from .relay import RelayClient, prepare_bundle, publish_if_configured, upload_pending
 from .soclaas import SoCLaaSClient
 from .telegram import TelegramClient, TelegramError
 from .telegram_delivery import deliver_pending, enqueue_digest
@@ -59,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("telegram-retry", help="Retry queued Telegram digests after correcting delivery problems")
     commands.add_parser("telegram-poll", help="Check once for Telegram commands and exit")
     commands.add_parser("telegram-listen", help="Continuously listen for Telegram commands")
+    commands.add_parser("relay-publish", help="Prepare and upload the latest encrypted cloud relay snapshot")
+    commands.add_parser("relay-status", help="Show local and cloud relay delivery status")
     return parser
 
 
@@ -90,6 +93,10 @@ OUTLOOK_TRIAGE_BOOTSTRAP_DAYS=7
 OUTLOOK_TRIAGE_OVERLAP_HOURS=8
 OUTLOOK_TRIAGE_MAX_BODY_CHARS=12000
 OUTLOOK_TRIAGE_DIGEST_HORIZON_DAYS=7
+OUTLOOK_TRIAGE_RELAY_URL=
+OUTLOOK_TRIAGE_RELAY_TOKEN=
+OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY=
+OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS=20
 """
     rules = """ignored_senders: []
 ignored_domains: []
@@ -215,6 +222,27 @@ def run(args: argparse.Namespace) -> int:
     try:
         if args.command == "tasks":
             return _run_tasks(args, db)
+        if args.command == "relay-publish":
+            settings.require_relay()
+            envelope = prepare_bundle(db, settings)
+            uploaded = upload_pending(db, settings, logger)
+            print(
+                f"Relay bundle {envelope['bundle_id']} intended_date={envelope['intended_date']} "
+                f"status={'confirmed' if uploaded else 'pending'}"
+            )
+            return 0 if uploaded else 1
+        if args.command == "relay-status":
+            settings.require_relay()
+            local = db.relay_bundle()
+            cloud = RelayClient(settings).status()
+            result = {
+                "local": dict(local) if local else None,
+                "cloud": cloud,
+            }
+            if result["local"]:
+                result["local"].pop("envelope_json", None)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
         if args.command == "telegram-retry":
             now = datetime.now(settings.timezone)
             with process_lock(settings.state_dir / "telegram-delivery.lock"):
@@ -286,7 +314,11 @@ def run(args: argparse.Namespace) -> int:
                 if args.command == "sync"
                 else run_retry(db, settings, logger, limit=args.limit)
             )
-            print(" ".join(f"{key}={value}" for key, value in counts.items()))
+            relay_uploaded = publish_if_configured(db, settings, logger)
+            print(
+                " ".join(f"{key}={value}" for key, value in counts.items())
+                + f" relay_pending={0 if relay_uploaded else 1}"
+            )
             return 0 if counts["failed"] == 0 else 2
     finally:
         db.close()

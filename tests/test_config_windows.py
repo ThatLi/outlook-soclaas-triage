@@ -24,6 +24,10 @@ CONFIG_ENV_NAMES = (
     "TELEGRAM_CHAT_ID",
     "TELEGRAM_TIMEOUT_SECONDS",
     "TELEGRAM_BODY_PREVIEW_CHARS",
+    "OUTLOOK_TRIAGE_RELAY_URL",
+    "OUTLOOK_TRIAGE_RELAY_TOKEN",
+    "OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY",
+    "OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS",
 )
 
 
@@ -114,6 +118,22 @@ def test_invalid_telegram_timeout_is_rejected(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="could not convert string to float"):
         load_settings()
+
+
+def test_relay_values_load_and_require_complete_configuration(monkeypatch, tmp_path):
+    _isolated_windows_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("OUTLOOK_TRIAGE_RELAY_URL", "https://relay.example.test/")
+    monkeypatch.setenv("OUTLOOK_TRIAGE_RELAY_TOKEN", "secret")
+    monkeypatch.setenv("OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY", "key")
+    monkeypatch.setenv("OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS", "7.5")
+    settings = load_settings()
+    assert settings.relay_configured
+    assert settings.relay_timeout_seconds == 7.5
+
+    monkeypatch.delenv("OUTLOOK_TRIAGE_RELAY_TOKEN")
+    incomplete = load_settings()
+    with pytest.raises(ConfigurationError, match="OUTLOOK_TRIAGE_RELAY_TOKEN"):
+        _ = incomplete.relay_configured
 
 
 def test_telegram_chats_requires_token_but_not_chat_id(monkeypatch, settings, capsys):

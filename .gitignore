@@ -12,6 +12,8 @@ secrets.env
 *.db
 *.sqlite*
 *.log
+node_modules/
+.wrangler/
 
 # Local development and verification
 work/

@@ -17,6 +17,8 @@ def test_digest_telegram_flag_is_opt_in():
     assert parser.parse_args(["telegram-retry"]).command == "telegram-retry"
     assert parser.parse_args(["telegram-poll"]).command == "telegram-poll"
     assert parser.parse_args(["telegram-listen"]).command == "telegram-listen"
+    assert parser.parse_args(["relay-publish"]).command == "relay-publish"
+    assert parser.parse_args(["relay-status"]).command == "relay-status"
 
 
 def test_local_digest_does_not_construct_telegram(monkeypatch, settings):
@@ -76,6 +78,22 @@ def test_permanent_delivery_failure_is_handled_without_scheduler_retry(monkeypat
     )
 
     assert cli.run(Namespace(command="digest", telegram=True, verbose=False)) == 0
+
+
+def test_sync_reports_pending_relay_without_changing_classification_exit(monkeypatch, settings, capsys):
+    configured = replace(
+        settings,
+        relay_url="https://relay.example.test",
+        relay_token="token",
+        relay_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    )
+    monkeypatch.setattr(cli, "load_settings", lambda: configured)
+    monkeypatch.setattr(cli, "run_sync", lambda *args: {
+        "processed": 1, "skipped": 0, "failed": 0, "unchanged": 0,
+    })
+    monkeypatch.setattr(cli, "publish_if_configured", lambda *args, **kwargs: False)
+    assert cli.run(Namespace(command="sync", verbose=False)) == 0
+    assert "relay_pending=1" in capsys.readouterr().out
 
 
 def test_scheduler_supports_opt_in_telegram_action():

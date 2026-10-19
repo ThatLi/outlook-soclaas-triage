@@ -45,6 +45,10 @@ class Settings:
     telegram_chat_id: str | None = None
     telegram_timeout_seconds: float = 20.0
     telegram_body_preview_chars: int = 6000
+    relay_url: str | None = None
+    relay_token: str | None = None
+    relay_encryption_key: str | None = None
+    relay_timeout_seconds: float = 20.0
 
     def require_telegram(self, *, require_chat: bool = True) -> None:
         missing: list[str] = []
@@ -54,6 +58,29 @@ class Settings:
             missing.append("TELEGRAM_CHAT_ID")
         if missing:
             raise ConfigurationError(f"Missing Telegram configuration: {', '.join(missing)}")
+
+    @property
+    def relay_configured(self) -> bool:
+        values = (self.relay_url, self.relay_token, self.relay_encryption_key)
+        if not any(values):
+            return False
+        self.require_relay()
+        return True
+
+    def require_relay(self) -> None:
+        missing = [
+            name
+            for name, value in (
+                ("OUTLOOK_TRIAGE_RELAY_URL", self.relay_url),
+                ("OUTLOOK_TRIAGE_RELAY_TOKEN", self.relay_token),
+                ("OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY", self.relay_encryption_key),
+            )
+            if not value
+        ]
+        if missing:
+            raise ConfigurationError(f"Incomplete relay configuration: missing {', '.join(missing)}")
+        if not str(self.relay_url).lower().startswith("https://"):
+            raise ConfigurationError("OUTLOOK_TRIAGE_RELAY_URL must use HTTPS")
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -96,6 +123,10 @@ def load_settings() -> Settings:
         telegram_chat_id=value("TELEGRAM_CHAT_ID"),
         telegram_timeout_seconds=float(value("TELEGRAM_TIMEOUT_SECONDS", "20") or 20),
         telegram_body_preview_chars=int(value("TELEGRAM_BODY_PREVIEW_CHARS", "6000") or 6000),
+        relay_url=value("OUTLOOK_TRIAGE_RELAY_URL"),
+        relay_token=value("OUTLOOK_TRIAGE_RELAY_TOKEN"),
+        relay_encryption_key=value("OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY"),
+        relay_timeout_seconds=float(value("OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS", "20") or 20),
         soclaas_base_url=(value("SOCLAAS_BASE_URL", "https://soclaas-api.comp.nus.edu.sg/v1") or "").rstrip("/"),
         model=value("EMAIL_TRIAGE_MODEL"),
         timezone_name=timezone_name,

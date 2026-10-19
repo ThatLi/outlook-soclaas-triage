@@ -54,6 +54,10 @@ OUTLOOK_TRIAGE_OVERLAP_HOURS=8
 OUTLOOK_TRIAGE_MAX_BODY_CHARS=12000
 OUTLOOK_TRIAGE_DIGEST_HORIZON_DAYS=7
 OUTLOOK_TRIAGE_TIMEOUT_SECONDS=45
+OUTLOOK_TRIAGE_RELAY_URL=
+OUTLOOK_TRIAGE_RELAY_TOKEN=
+OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY=
+OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS=20
 ```
 
 Leave `OUTLOOK_PROFILE` blank to use the default profile. Set it only when classic Outlook has multiple named profiles and the default is not the intended one.
@@ -95,12 +99,16 @@ ignored_subject_patterns:
 
 Matches are case-insensitive and subject patterns are regular expressions. The application deliberately does not discard all `no-reply` or low-importance messages.
 
-Continue with the [User Guide](docs/User-Guide.md) for synchronization, task management, digests, Telegram delivery, and Windows scheduling.
+Continue with the [User Guide](docs/User-Guide.md) for synchronization, task management, digests, Telegram delivery, and Windows scheduling. To deliver the newest prepared digest while this Windows device is off, follow the optional [Cloudflare Relay Guide](docs/Cloud-Relay.md).
 
 ## Test
 
 ```powershell
 python -m pytest
+cd relay
+npm ci
+npm run typecheck
+npm test
 ```
 
 All Outlook tests use mock COM objects and do not open or access a live mailbox.

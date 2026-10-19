@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from .config import ConfigurationError, Settings
 from .database import Database
@@ -13,11 +13,17 @@ from .digest import build_digest
 from .locking import AlreadyRunning, process_lock
 from .operations import run_retry, run_sync
 from .outlook import OutlookClient, OutlookError
+from .relay import publish_if_configured
 from .telegram import TelegramClient, TelegramError, format_digest
 from .telegram_commands import HELP_TEXT, format_body_preview, format_status, format_task_list, parse_command
 
 
 TERMINAL_UPDATE_STATES = {"responded", "failed"}
+
+
+class ResponseSender(Protocol):
+    def send_message(self, text: str, *, chat_id: str | None = None, parse_mode: str | None = "HTML") -> None: ...
+    def send_plain_message(self, text: str, *, chat_id: str | None = None) -> None: ...
 
 
 def _counts_message(action: str, counts: dict[str, int]) -> str:
@@ -73,8 +79,13 @@ def _process_operation(
             if command.action == "retry"
             else run_sync(db, settings, logger)
         )
+        relay_uploaded = publish_if_configured(db, settings, logger)
         db.set_telegram_update_status(update_id, "applied")
         telegram.send_plain_message(_counts_message(command.action, counts))
+        if not relay_uploaded:
+            telegram.send_plain_message(
+                "The Outlook operation completed, but the cloud relay snapshot remains pending."
+            )
         if command.action == "list":
             _send_live_digest(db, settings, telegram)
         db.set_telegram_update_status(update_id, "responded")
@@ -153,37 +164,26 @@ def _show_body(
         telegram.send_message(chunk)
 
 
-def process_update(
+def process_command(
     db: Database,
     settings: Settings,
-    telegram: TelegramClient,
-    update: dict[str, Any],
+    telegram: ResponseSender,
+    update_id: int,
+    chat_id: str,
+    text: str,
     logger: logging.Logger,
     *,
     outlook_factory: Callable[..., OutlookClient] = OutlookClient,
 ) -> bool:
-    """Process one update. Return True when its offset may be advanced."""
-    update_id = update.get("update_id")
-    if not isinstance(update_id, int):
-        return True
-    message = update.get("message")
-    if not isinstance(message, dict):
-        return True
-    chat = message.get("chat")
-    sender = message.get("from")
-    if not isinstance(chat, dict) or str(chat.get("id", "")) != str(settings.telegram_chat_id):
-        return True
-    if isinstance(sender, dict) and sender.get("is_bot"):
-        return True
-
+    """Execute an authorized command independently of its inbound transport."""
     existing = db.telegram_update(update_id)
     if existing is not None and str(existing["status"]) in TERMINAL_UPDATE_STATES:
         return True
 
-    command = parse_command(str(message.get("text") or ""))
+    command = parse_command(text)
     command_name = command.action if command else "invalid"
     task_ids = command.task_ids if command else ()
-    db.record_telegram_update(update_id, str(settings.telegram_chat_id), command_name, task_ids)
+    db.record_telegram_update(update_id, chat_id, command_name, task_ids)
 
     if command is None:
         telegram.send_plain_message(f"Command not recognized.\n\n{HELP_TEXT}")
@@ -320,6 +320,40 @@ def process_update(
         )
         db.set_telegram_update_status(update_id, "failed", error_category="database")
         return True
+
+
+def process_update(
+    db: Database,
+    settings: Settings,
+    telegram: TelegramClient,
+    update: dict[str, Any],
+    logger: logging.Logger,
+    *,
+    outlook_factory: Callable[..., OutlookClient] = OutlookClient,
+) -> bool:
+    """Validate one raw Telegram update, then execute its authorized command."""
+    update_id = update.get("update_id")
+    if not isinstance(update_id, int):
+        return True
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return True
+    chat = message.get("chat")
+    sender = message.get("from")
+    if not isinstance(chat, dict) or str(chat.get("id", "")) != str(settings.telegram_chat_id):
+        return True
+    if isinstance(sender, dict) and sender.get("is_bot"):
+        return True
+    return process_command(
+        db,
+        settings,
+        telegram,
+        update_id,
+        str(chat.get("id")),
+        str(message.get("text") or ""),
+        logger,
+        outlook_factory=outlook_factory,
+    )
 
 
 def process_updates(
