@@ -112,12 +112,12 @@ async function unseal(env: Env, id: string, value: string): Promise<string[]> {
 }
 
 // Escape after splitting: long bodies cannot split an HTML entity or tag.
-export function textChunks(text: string): string[] {
+export function textChunks(text: string, limit = 3400): string[] {
   const chunks: string[] = [];
   let chunk = "";
   for (const character of text || "(empty)") {
     const escaped = escapeHtml(character);
-    if (chunk.length + escaped.length > 3400) { chunks.push(chunk); chunk = ""; }
+    if (chunk.length + escaped.length > limit) { chunks.push(chunk); chunk = ""; }
     chunk += escaped;
   }
   if (chunk) chunks.push(chunk);
@@ -148,6 +148,48 @@ async function snapshot(env: Env): Promise<BridgeSnapshot | null> {
   return { ...data, tasks: data.tasks.map(t => ({ ...t, status: lookup.get(t.id) ?? t.status })) };
 }
 
+function packDigestBlocks(blocks: string[], limit = 3400): string[] {
+  const messages: string[] = [];
+  let current = "";
+  for (const block of blocks) {
+    const candidate = current ? `${current}\n\n${block}` : block;
+    if (current && candidate.length > limit) { messages.push(current); current = block; }
+    else current = candidate;
+  }
+  if (current) messages.push(current);
+  return messages;
+}
+
+function digestTaskParts(task: CloudTask, today: string): string[] {
+  const id = `<code>#${task.id}</code>`;
+  const parts = textChunks(task.description, 1800).map((description, index) =>
+    `${index ? "↳" : "☐"} ${id}${index ? " <i>(continued)</i>" : ""} ${description}`);
+  const metadata: string[] = [];
+  if (task.deadline) {
+    const label = task.deadline === today ? "today" : new Intl.DateTimeFormat("en-GB", {
+      day: "numeric", month: "short", timeZone: "UTC",
+    }).format(new Date(`${task.deadline}T00:00:00Z`));
+    metadata.push(`Due <b>${escapeHtml(label)}</b>`);
+  }
+  const sender = task.sender_name || task.sender_address;
+  if (sender) metadata.push(...textChunks(sender, 1000).map(piece => `<i>${piece}</i>`));
+  for (const line of metadata) {
+    const last = parts.length - 1;
+    if (parts[last].length + line.length + 2 <= 3000) parts[last] += `\n ${line}`;
+    else parts.push(`↳ ${id}\n ${line}`);
+  }
+  return parts;
+}
+
+function digestSection(heading: string, emoji: string, tasks: CloudTask[], today: string): string[] {
+  if (!tasks.length) return [];
+  const title = `${emoji} <b>${escapeHtml(heading.toUpperCase())} · ${tasks.length}</b>`;
+  // Split only at complete rendered fragments. Each fragment has balanced HTML,
+  // including repeated task IDs when a long description needs continuation.
+  const groups = packDigestBlocks(tasks.flatMap(task => digestTaskParts(task, today)), 3400 - title.length - 60);
+  return groups.map((group, index) => `${title}${groups.length > 1 ? ` — PART ${index + 1} OF ${groups.length}` : ""}\n\n${group}`);
+}
+
 export function renderDigest(data: BridgeSnapshot, now = new Date()): string[] {
   const today = singaporeClock(now).date;
   const horizon = new Date(Date.parse(today) + data.horizon_days * 86400000).toISOString().slice(0, 10);
@@ -165,18 +207,32 @@ export function renderDigest(data: BridgeSnapshot, now = new Date()): string[] {
     else group = 3;
     groups[group][1].push(task);
   }
-  const lines = [`Inbox brief — ${today}`, `Last successful Outlook sync: ${data.health.last_sync ?? "never"}`,
-    "Mailbox data is a bridge snapshot; cloud task states are current."];
-  if (data.health.last_run?.status !== "success") lines.push("Warning: latest mailbox synchronization did not finish successfully.");
-  if (data.health.pending_or_failed) lines.push(`Warning: ${data.health.pending_or_failed} pending or failed classifications.`);
-  for (const [heading, tasks] of groups) {
-    lines.push("", heading, ...(tasks.length ? tasks.map(t => `#${t.id} ${t.description}${t.deadline ? ` — due ${t.deadline}` : ""}${t.sender_name || t.sender_address ? ` (${t.sender_name || t.sender_address})` : ""}`) : ["None"]));
-  }
-  lines.push("", "Last 24 hours at snapshot preparation:");
+  const emojis = ["🔴", "🟠", "🟡", "⚪", "💤"];
+  const summary = [
+    `📬 <b>Inbox brief — ${today}</b>`,
+    ["<b>OPEN ACTIONS</b>", ...groups.map(([heading, tasks], index) =>
+      `${emojis[index]} ${escapeHtml(heading)}: <b>${tasks.length}</b>`)].join("\n"),
+  ];
+  const sync = ["🔄 <b>SYNCHRONIZATION</b>",
+    ...textChunks(data.health.last_sync ?? "never", 2000).map(value => `Last successful Outlook sync: <b>${value}</b>`),
+    "<i>Mailbox data is a bridge snapshot; cloud task states are current.</i>"];
+  if (data.health.last_run?.status !== "success") sync.push("⚠️ <b>Warning:</b> latest mailbox synchronization did not finish successfully.");
+  if (data.health.pending_or_failed) sync.push(`⚠️ <b>${data.health.pending_or_failed}</b> pending or failed classifications.`);
+  const activity = ["📊 <b>LAST 24 HOURS AT SNAPSHOT PREPARATION</b>"];
   for (const [name, key] of [["Informational", "information_count"], ["Newsletters", "newsletter_count"], ["Automated", "automated_count"], ["Explicitly skipped", "skipped_count"]]) {
-    lines.push(`${name}: ${data.counts[key] ?? 0}`);
+    activity.push(`• ${name}: <b>${escapeHtml(String(data.counts[key] ?? 0))}</b>`);
   }
-  return textChunks(lines.join("\n"));
+  summary.push(activity.join("\n"), ...sync);
+  const messages = packDigestBlocks(summary);
+  const sections = groups.map(([heading, tasks], index) => digestSection(heading, emojis[index], tasks, today));
+  let compact: string[] = [];
+  for (const parts of sections) {
+    if (parts.length > 1) {
+      messages.push(...packDigestBlocks(compact), ...parts);
+      compact = [];
+    } else compact.push(...parts);
+  }
+  return [...messages, ...packDigestBlocks(compact)];
 }
 
 async function flush(env: Env): Promise<void> {

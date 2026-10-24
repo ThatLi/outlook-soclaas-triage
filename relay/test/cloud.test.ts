@@ -140,7 +140,7 @@ describe("cloud bot with real SQLite", () => {
   it("queues list while returning a dated digest and preserves task ids", async () => {
     await command("/list");
     expect(sent.join("\n")).toContain("Last successful Outlook sync");
-    expect(sent.join("\n")).toContain("#1 Private task 1 &lt;review&gt;");
+    expect(sent.join("\n")).toContain("<code>#1</code> Private task 1 &lt;review&gt;");
     expect((await poll()).job?.task_ids).toEqual([]);
     await command("/read #1 #1 2");
     const pending = database.db.prepare("SELECT task_ids FROM cloud_events WHERE action='read'").get();
@@ -189,8 +189,9 @@ describe("cloud bot with real SQLite", () => {
     expect(sent.length).toBe(start);
     await runCloudScheduled(env, new Date("2026-10-21T00:00:00Z"));
     const count = sent.length;
-    expect(sent.at(-1)).toContain("Inbox brief — 2026-10-21");
-    expect(sent.at(-1)).toContain("Waiting / follow-up\n#1");
+    expect(sent.slice(start).join("\n")).toContain("<b>Inbox brief — 2026-10-21</b>");
+    expect(sent.slice(start).join("\n")).toContain("<b>WAITING / FOLLOW-UP · 1</b>");
+    expect(sent.slice(start).join("\n")).toContain("<code>#1</code>");
     await runCloudScheduled(env, new Date("2026-10-21T00:05:00Z"));
     expect(sent.length).toBe(count);
     await runCloudScheduled(env, new Date("2026-10-22T00:00:00Z"));
@@ -224,7 +225,41 @@ describe("command and rendering contracts", () => {
     const chunks = textChunks("<>&😀".repeat(3000));
     expect(chunks.every(c => c.length <= 3400 && !c.endsWith("&"))).toBe(true);
     const data = fixture(); data.tasks[0].status = "done";
-    expect(renderDigest(data).join("\n")).not.toContain("#1 Private task");
-    expect(renderDigest(data).join("\n")).toContain("#2 Private task");
+    expect(renderDigest(data).join("\n")).not.toContain("<code>#1</code> Private task");
+    expect(renderDigest(data).join("\n")).toContain("<code>#2</code> Private task");
+  });
+  it("restores digest headings, task IDs, deadline emphasis and escaped senders", () => {
+    const data = fixture();
+    data.tasks[0].sender_name = "A & B <team>";
+    const rendered = renderDigest(data, new Date("2026-10-22T00:00:00Z")).join("\n");
+    expect(rendered).toContain("📬 <b>Inbox brief — 2026-10-22</b>");
+    expect(rendered).toContain("<b>OPEN ACTIONS</b>");
+    expect(rendered).toContain("🟠 <b>URGENT / DUE TODAY · 2</b>");
+    expect(rendered).toContain("☐ <code>#1</code> Private task 1 &lt;review&gt;");
+    expect(rendered).toContain("Due <b>today</b>");
+    expect(rendered).toContain("<i>A &amp; B &lt;team&gt;</i>");
+    expect(rendered).toContain("Informational: <b>3</b>");
+    expect(rendered).not.toContain("&lt;b&gt;");
+  });
+  it("keeps long digest chunks balanced and within Telegram limits without losing task content", () => {
+    const data = fixture();
+    data.tasks[0].description = "<>&😀".repeat(3000);
+    data.tasks[0].sender_name = "<sender&>".repeat(1000);
+    const chunks = renderDigest(data);
+    expect(chunks.length).toBeGreaterThan(3);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(3400);
+      const stack: string[] = [];
+      for (const match of chunk.matchAll(/<(\/?)(b|i|code)>/g)) {
+        if (match[1]) expect(stack.pop()).toBe(match[2]);
+        else stack.push(match[2]);
+      }
+      expect(stack).toEqual([]);
+      expect(chunk).not.toMatch(/&(?!amp;|lt;|gt;)/);
+    }
+    const joined = chunks.join("\n");
+    expect(joined.match(/&lt;&gt;&amp;😀/g)).toHaveLength(3000);
+    expect(joined).toContain("PART 2 OF");
+    expect(joined).toContain("<i>(continued)</i>");
   });
 });
