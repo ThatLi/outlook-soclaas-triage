@@ -1,9 +1,13 @@
+import { cloudFetch, runCloudScheduled, type BridgeSnapshot } from "./cloud";
+
 export interface Env {
   DB: D1Database;
   RELAY_TOKEN: string;
   RELAY_ENCRYPTION_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_CHAT_ID: string;
+  CLOUD_BOT_ENABLED?: string;
+  TELEGRAM_WEBHOOK_SECRET?: string;
 }
 
 export interface BundleEnvelope {
@@ -17,6 +21,7 @@ export interface BundleEnvelope {
 }
 
 export interface BundlePayload {
+  bridge?: BridgeSnapshot;
   schema_version: number;
   digest_chunks: string[];
   cached_commands: {
@@ -125,7 +130,7 @@ export function singaporeClock(now: Date): { date: string; hour: number } {
   return { date: shifted.toISOString().slice(0, 10), hour: shifted.getUTCHours() };
 }
 
-function envelopeFromRow(row: Record<string, unknown>): BundleEnvelope {
+export function envelopeFromRow(row: Record<string, unknown>): BundleEnvelope {
   return {
     schema_version: Number(row.schema_version),
     bundle_id: String(row.bundle_id),
@@ -178,7 +183,7 @@ async function relayStatus(env: Env, now = new Date()): Promise<Response> {
   return json({ latest_bundle: latest ?? null, today_delivery: delivery ?? null });
 }
 
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
@@ -191,9 +196,10 @@ function provenance(envelope: BundleEnvelope): string {
   ].join("\n");
 }
 
-async function telegramSend(env: Env, text: string): Promise<void> {
+export async function telegramSend(env: Env, text: string): Promise<void> {
   const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
+    signal: AbortSignal.timeout(10000),
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
   });
@@ -275,6 +281,11 @@ export async function runScheduled(env: Env, now = new Date()): Promise<void> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    if (env.CLOUD_BOT_ENABLED === "true") {
+      const response = await cloudFetch(request, env);
+      response.headers.set("cache-control", "no-store");
+      return response;
+    }
     if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/v1/bundles") return acceptBundle(request, env);
@@ -282,6 +293,6 @@ export default {
     return json({ error: "not found" }, 404);
   },
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runScheduled(env));
+    ctx.waitUntil(env.CLOUD_BOT_ENABLED === "true" ? runCloudScheduled(env) : runScheduled(env));
   },
 };
