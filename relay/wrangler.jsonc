@@ -2,9 +2,14 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "outlook-triage-relay",
   "main": "src/index.ts",
+  "workers_dev": true,
   "compatibility_date": "2026-10-01",
+  "vars": {
+    // Requires migration 0002; set false to restore the legacy outbound relay.
+    "CLOUD_BOT_ENABLED": "true"
+  },
   "triggers": {
-    "crons": ["*/30 * * * *"]
+    "crons": ["*/5 * * * *"]
   },
   "d1_databases": [
     {

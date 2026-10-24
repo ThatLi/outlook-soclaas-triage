@@ -1,5 +1,8 @@
 # Outlook–SoCLaaS Triage User Guide
 
+The commands below describe local mode. For cloud commands and queued mailbox
+operations, follow the [Cloud Bot and Outlook Bridge guide](Cloud-Bot.md).
+
 This guide is the reference for operating Outlook–SoCLaaS Triage after installation. Complete the installation, configuration, and manual safety checks in the [README](../README.md) before using these commands or registering scheduled tasks.
 
 The supported user interfaces are the `outlook-triage` command-line program and `scripts\register_windows_tasks.ps1`. The application does not expose a public HTTP API or a stable Python SDK. Python modules and other scripts in the repository are internal implementation details.

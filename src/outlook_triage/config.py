@@ -49,6 +49,8 @@ class Settings:
     relay_token: str | None = None
     relay_encryption_key: str | None = None
     relay_timeout_seconds: float = 20.0
+    cloud_bot_enabled: bool = False
+    telegram_webhook_secret: str | None = None
 
     def require_telegram(self, *, require_chat: bool = True) -> None:
         missing: list[str] = []
@@ -127,6 +129,8 @@ def load_settings() -> Settings:
         relay_token=value("OUTLOOK_TRIAGE_RELAY_TOKEN"),
         relay_encryption_key=value("OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY"),
         relay_timeout_seconds=float(value("OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS", "20") or 20),
+        cloud_bot_enabled=(value("OUTLOOK_TRIAGE_CLOUD_BOT", "false") or "false").lower() == "true",
+        telegram_webhook_secret=value("TELEGRAM_WEBHOOK_SECRET"),
         soclaas_base_url=(value("SOCLAAS_BASE_URL", "https://soclaas-api.comp.nus.edu.sg/v1") or "").rstrip("/"),
         model=value("EMAIL_TRIAGE_MODEL"),
         timezone_name=timezone_name,

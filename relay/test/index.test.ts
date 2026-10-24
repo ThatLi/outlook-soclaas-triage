@@ -5,7 +5,9 @@ import worker, {
   type BundleEnvelope, type Env,
 } from "../src/index";
 
-const key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+// Public test vector shared with Python's bytes(range(32)), not a deployed key.
+const keyBytes = Uint8Array.from({ length: 32 }, (_, i) => i);
+const key = btoa(String.fromCharCode(...keyBytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const pythonFixture: BundleEnvelope = {
   schema_version: 1,
   bundle_id: "9c36de71-c074-44f3-bc5e-07e9489c5147",
