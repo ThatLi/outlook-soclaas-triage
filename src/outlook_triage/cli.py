@@ -62,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("telegram-listen", help="Continuously listen for Telegram commands")
     commands.add_parser("relay-publish", help="Prepare and upload the latest encrypted cloud relay snapshot")
     commands.add_parser("relay-status", help="Show local and cloud relay delivery status")
+    commands.add_parser("cloud-webhook-enable", help="Route Telegram commands to the deployed cloud bot")
+    commands.add_parser("cloud-webhook-disable", help="Remove the cloud webhook for rollback to local polling")
+    commands.add_parser("cloud-check", help="Verify cloud bot connectivity before changing Windows schedules")
+    for name in ("bridge-poll", "bridge-listen"):
+        bridge = commands.add_parser(name, help="Process cloud commands through an outbound-only Outlook bridge")
+        bridge.add_argument("--cache-previews", action="store_true", help="Upload bounded encrypted email previews for cloud /show")
     return parser
 
 
@@ -83,6 +89,7 @@ def initialize(settings: Settings) -> None:
 SOCLAAS_API_KEY=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+TELEGRAM_WEBHOOK_SECRET=
 TELEGRAM_TIMEOUT_SECONDS=20
 TELEGRAM_BODY_PREVIEW_CHARS=6000
 SOCLAAS_BASE_URL=https://soclaas-api.comp.nus.edu.sg/v1
@@ -97,6 +104,7 @@ OUTLOOK_TRIAGE_RELAY_URL=
 OUTLOOK_TRIAGE_RELAY_TOKEN=
 OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY=
 OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS=20
+OUTLOOK_TRIAGE_CLOUD_BOT=false
 """
     rules = """ignored_senders: []
 ignored_domains: []
@@ -144,6 +152,13 @@ def run(args: argparse.Namespace) -> int:
     settings = load_settings()
     ensure_runtime_directories(settings)
     logger = configure_logging(settings.log_file, args.verbose)
+
+    if settings.cloud_bot_enabled and (
+        args.command in {"sync", "retry-failed", "relay-publish", "telegram-poll", "telegram-listen", "telegram-retry"}
+        or (args.command == "digest" and args.telegram)
+        or (args.command == "tasks" and args.task_command != "list")
+    ):
+        raise ConfigurationError("Cloud bot owns task state and Telegram delivery. Use bridge-poll or bridge-listen and send commands to the bot.")
 
     if args.command == "init":
         initialize(settings)
@@ -218,8 +233,71 @@ def run(args: argparse.Namespace) -> int:
         print("Classification was not saved. Run `sync` to persist inbox results.")
         return 0
 
+    if args.command == "cloud-check":
+        from hashlib import sha256
+        settings.require_relay()
+        result = RelayClient(settings)._request("GET", "/v2/config")
+        if not result.get("cloud_bot_enabled"):
+            raise ConfigurationError("Cloud bot is not enabled on the configured endpoint")
+        if settings.telegram_webhook_secret and result.get("webhook_secret_sha256") != sha256(settings.telegram_webhook_secret.encode()).hexdigest():
+            raise ConfigurationError("Local webhook secret does not match the deployed Worker")
+        print("Cloud bot connectivity and configured webhook secret verified.")
+        return 0
+
+    if args.command == "cloud-webhook-disable":
+        settings.require_telegram()
+        TelegramClient(settings.telegram_bot_token or "", settings.telegram_chat_id).delete_webhook()
+        print("Cloud webhook removed; pending Telegram updates were retained.")
+        return 0
+
     db = Database(settings.database_file)
     try:
+        if args.command in {"bridge-poll", "bridge-listen"}:
+            from .bridge import bridge_cycle, listen_bridge
+            settings.require_relay()
+            if not settings.cloud_bot_enabled:
+                raise ConfigurationError("Set OUTLOOK_TRIAGE_CLOUD_BOT=true after deploying and enabling the cloud bot")
+            with process_lock(settings.state_dir / "cloud-bridge.lock", stale_after_seconds=7200,
+                              label="cloud bridge", recover_dead_owner=True):
+                if args.command == "bridge-poll":
+                    processed = bridge_cycle(db, settings, logger, cache_previews=args.cache_previews)
+                    print(f"Cloud bridge pass complete: commands={processed}")
+                else:
+                    print("Cloud Outlook bridge started. Press Ctrl+C to stop.")
+                    listen_bridge(db, settings, logger, cache_previews=args.cache_previews)
+            return 0
+        if args.command == "cloud-webhook-enable":
+            from getpass import getpass
+            from .bridge import BridgeClient, initialize_bridge
+            settings.require_telegram()
+            settings.require_relay()
+            if not settings.cloud_bot_enabled:
+                raise ConfigurationError("Set OUTLOOK_TRIAGE_CLOUD_BOT=true first")
+            BridgeClient(settings, initialize_bridge(db)).poll()
+            secret = settings.telegram_webhook_secret or getpass("Worker TELEGRAM_WEBHOOK_SECRET (hidden): ")
+            from hashlib import sha256
+            cloud_config = BridgeClient(settings, initialize_bridge(db))._request("GET", "/v2/config")
+            if cloud_config.get("webhook_secret_sha256") != sha256(secret.encode()).hexdigest():
+                raise ConfigurationError("Secret does not match the deployed Worker; webhook was not changed")
+            telegram = TelegramClient(settings.telegram_bot_token or "", settings.telegram_chat_id)
+            url = f"{settings.relay_url.rstrip('/')}/telegram/webhook"
+            telegram.set_webhook(url, secret)
+            descriptions = {
+                "list": "Show cloud digest and queue mailbox synchronization",
+                "sync": "Queue mailbox synchronization on the Windows bridge",
+                "retry": "Queue failed classification retries on the bridge",
+                "tasks": "List cloud tasks, optionally by status",
+                "status": "Show cloud tasks, bridge freshness and queued work",
+                "show": "Show an optional cached email preview",
+                "read": "Queue marking original emails read",
+                "done": "Complete tasks after the bridge marks emails read",
+                "dismiss": "Dismiss tasks after the bridge marks emails read",
+            }
+            telegram.set_commands(tuple((name, descriptions.get(name, text)) for name, text in BOT_COMMANDS))
+            if telegram.webhook_info().get("url") != url:
+                raise ConfigurationError("Telegram did not confirm the cloud webhook")
+            print("Cloud webhook enabled and verified; pending Telegram updates were retained.")
+            return 0
         if args.command == "tasks":
             return _run_tasks(args, db)
         if args.command == "relay-publish":

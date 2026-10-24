@@ -25,6 +25,10 @@ DELIVERY_HOUR = 8
 class RelayError(RuntimeError):
     """A sanitized relay error safe to print or log."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 def _b64encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
@@ -129,7 +133,7 @@ class RelayClient:
         if response.status_code >= 500 or response.status_code == 429:
             raise RelayError("Cloud relay is temporarily unavailable")
         if response.status_code >= 400:
-            raise RelayError(f"Cloud relay rejected the request (HTTP {response.status_code})")
+            raise RelayError(f"Cloud relay rejected the request (HTTP {response.status_code})", status_code=response.status_code)
         try:
             result = response.json()
         except ValueError as exc:

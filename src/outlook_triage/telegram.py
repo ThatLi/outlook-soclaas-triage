@@ -493,6 +493,16 @@ class TelegramClient:
         result = self._request("getWebhookInfo")
         return result if isinstance(result, dict) else {}
 
+    def set_webhook(self, url: str, secret: str) -> None:
+        if not url.startswith("https://") or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", secret):
+            raise TelegramError("Webhook requires HTTPS and a 32-256 character independent secret", category="configuration")
+        self._request("setWebhook", {"url": url, "secret_token": secret,
+                                     "allowed_updates": '["message"]', "max_connections": 1,
+                                     "drop_pending_updates": False})
+
+    def delete_webhook(self) -> None:
+        self._request("deleteWebhook", {"drop_pending_updates": False})
+
     def set_commands(self, commands: tuple[tuple[str, str], ...]) -> None:
         payload = [{"command": command, "description": description} for command, description in commands]
         self._request("setMyCommands", {"commands": json.dumps(payload, ensure_ascii=False)})
