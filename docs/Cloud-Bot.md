@@ -25,6 +25,42 @@ failure keeps earlier successes. `/read` leaves task state unchanged. `/done` an
 `/reopen` commands take precedence over older queued completions. Repeated
 Telegram update IDs never create a second command.
 
+### Quiet task feedback
+
+`/done`, `/dismiss`, `/waiting`, `/reopen`, and `/read` update the latest tracked
+digest containing each task. Accepted commands are deleted from the private chat
+only after their feedback has been delivered. Invalid commands remain visible.
+Mailbox commands show a pending label until Outlook acknowledges each item:
+
+| Task state | Appearance |
+| --- | --- |
+| Open | `☐ #42 Submit report` |
+| Done requested | `☐ #42 · ⏳ Done pending Submit report` |
+| Done confirmed | `☑ #42 Submit report` |
+| Dismissed confirmed | `☒ #42 Submit report` |
+| Waiting | `☐ #42 · 💤 Waiting Submit report` |
+
+`/read` shows read progress without completing the task. Successful task commands
+do not add queued/completed replies when a tracked digest can show their feedback.
+Failures still send actionable replies; partial successes stay checked off.
+Newer cloud task changes take precedence over older mailbox acknowledgements.
+
+Sent digests retain their original rows, date, and section membership. Section
+and summary totals count remaining open/waiting rows in those original sections;
+waiting/reopened tasks show their current state in place. Fresh digests regroup
+tasks normally and omit done/dismissed tasks. Earlier digests remain history.
+
+If a task has no tracked digest, or Telegram rejects an edit because a digest was
+deleted or cannot be edited, the bot sends a concise fallback reply. Telegram
+cleanup is best effort: commands older than 48 hours cannot generally be deleted,
+and failed deletion does not undo the action. Other commands, including `/list`,
+`/sync`, and `/retry`, keep their existing replies. Local listener mode is unchanged.
+
+When upgrading, apply D1 migration `0003_digest_interactions.sql` before deploying
+the Worker. Previously sent digests cannot be edited because their Telegram IDs
+were not saved; use `/list` to obtain a tracked digest. No local database change
+or bridge update is required for this feature.
+
 The bridge polls every 30 seconds and synchronizes once per Singapore-time
 four-hour slot: **00:00, 04:00, 08:00, 12:00, 16:00, 20:00**. Starting or resuming
 it catches up in the current slot without replaying missed slots. Explicit `/sync`
@@ -114,10 +150,13 @@ Manage tasks in Telegram. Use one bridge and the same local database; do not run
 independently modified copies. Back up both local SQLite and cloud D1.
 
 Queued commands and per-item progress have no 24-hour expiry. Frozen encrypted
-responses resume after network failure on a subsequent webhook, bridge, or Cron
-request. Telegram has no sendMessage idempotency key: a lost acceptance response
-can duplicate one chunk. Delivered responses are deleted after 30 days, while
-update deduplication records remain. Monitor free-tier storage as history grows.
+responses and digest edits resume after network failure on a subsequent webhook,
+bridge, or Cron request. Edits are rendered from current state when delivered;
+Telegram rate-limit retry delays are respected. Telegram has no sendMessage
+idempotency key: a lost acceptance response can duplicate one chunk. Delivered
+responses are deleted after 30 days. Encrypted digest layouts and Telegram IDs are
+also retained for 30 days, with cleanup deferred while output is pending. Update
+deduplication records remain. Monitor free-tier storage as history grows.
 After an interrupted process, the bridge verifies the recorded process is dead
 before recovering its lock; it does not displace a live bridge.
 Free-tier resource limits can pause service; no paid plan is enabled or assumed.
@@ -126,7 +165,7 @@ are corrected. A permanently failing first reply can delay later replies.
 
 For acceptance, keep Windows off for 48 hours and exercise cloud commands, queued
 mailbox commands, and both morning digests. Reconnect and verify queued changes
-and completion replies against Outlook. Automated tests do not replace this test.
+and digest checkmarks against Outlook. Automated tests do not replace this test.
 
 For rollback, first let the bridge drain commands and mirror cloud task changes
 into SQLite. Stop/disable Cloud Bridge, run `cloud-webhook-disable`, set the local

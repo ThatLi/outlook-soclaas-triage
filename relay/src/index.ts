@@ -196,15 +196,33 @@ function provenance(envelope: BundleEnvelope): string {
   ].join("\n");
 }
 
-export async function telegramSend(env: Env, text: string): Promise<void> {
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+export class TelegramApiError extends Error {
+  constructor(readonly code: number, readonly description: string, readonly retryAfter = 0) {
+    super(`Telegram request failed (HTTP ${code})`);
+  }
+}
+
+export async function telegramRequest(env: Env, method: string, parameters: Record<string, unknown>): Promise<{ message_id?: number } | undefined> {
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: "POST",
     signal: AbortSignal.timeout(10000),
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
+    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, ...parameters }),
   });
-  const result = await response.json().catch(() => null) as { ok?: boolean } | null;
-  if (!response.ok || !result?.ok) throw new Error(`Telegram delivery failed (HTTP ${response.status})`);
+  const result = await response.json().catch(() => null) as {
+    ok?: boolean; result?: { message_id?: number }; error_code?: number;
+    description?: string; parameters?: { retry_after?: number };
+  } | null;
+  if (!response.ok || !result?.ok) throw new TelegramApiError(
+    result?.error_code ?? response.status, result?.description ?? "",
+    Math.max(0, Number(result?.parameters?.retry_after) || 0),
+  );
+  return result.result;
+}
+
+export async function telegramSend(env: Env, text: string): Promise<number | null> {
+  const result = await telegramRequest(env, "sendMessage", { text, parse_mode: "HTML", disable_web_page_preview: true });
+  return Number.isSafeInteger(result?.message_id) && result!.message_id! > 0 ? result!.message_id! : null;
 }
 
 async function ensureDelivery(env: Env, deliveryDate: string, nowText: string): Promise<DeliveryRow> {

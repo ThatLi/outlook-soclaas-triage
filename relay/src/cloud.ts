@@ -1,7 +1,9 @@
 import {
-  decryptEnvelope, escapeHtml, singaporeClock, telegramSend, validateEnvelope,
+  decryptEnvelope, escapeHtml, singaporeClock, validateEnvelope,
   type BundlePayload, type Env,
 } from "./index";
+
+import { outbox, digestOutbox, taskFeedback, flush } from "./cloud_ui";
 
 type Status = "open" | "waiting" | "done" | "dismissed";
 export interface CloudTask {
@@ -84,33 +86,6 @@ export function validateBridge(value: unknown): BridgeSnapshot {
   return data;
 }
 
-function b64(bytes: Uint8Array): string {
-  return btoa(Array.from(bytes, b => String.fromCharCode(b)).join(""));
-}
-function unb64(value: string): Uint8Array<ArrayBuffer> {
-  return Uint8Array.from(atob(value), c => c.charCodeAt(0));
-}
-async function encryptionKey(env: Env): Promise<CryptoKey> {
-  const bytes = unb64(env.RELAY_ENCRYPTION_KEY.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - env.RELAY_ENCRYPTION_KEY.length % 4) % 4));
-  return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
-}
-async function seal(env: Env, id: string, chunks: string[]): Promise<string> {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv, additionalData: new TextEncoder().encode(id) },
-    await encryptionKey(env), new TextEncoder().encode(JSON.stringify(chunks)),
-  );
-  return JSON.stringify({ iv: b64(iv), ciphertext: b64(new Uint8Array(ciphertext)) });
-}
-async function unseal(env: Env, id: string, value: string): Promise<string[]> {
-  const data = JSON.parse(value);
-  const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: unb64(data.iv), additionalData: new TextEncoder().encode(id) },
-    await encryptionKey(env), unb64(data.ciphertext),
-  );
-  return JSON.parse(new TextDecoder().decode(plain));
-}
-
 // Escape after splitting: long bodies cannot split an HTML entity or tag.
 export function textChunks(text: string, limit = 3400): string[] {
   const chunks: string[] = [];
@@ -123,12 +98,6 @@ export function textChunks(text: string, limit = 3400): string[] {
   if (chunk) chunks.push(chunk);
   return chunks;
 }
-async function outbox(env: Env, chunks: string[]): Promise<D1PreparedStatement> {
-  const id = crypto.randomUUID();
-  return env.DB.prepare("INSERT INTO cloud_outbox(id,sealed_chunks,created_at) VALUES(?,?,?)")
-    .bind(id, await seal(env, id, chunks), new Date().toISOString());
-}
-
 async function withLock(env: Env, work: () => Promise<Response>): Promise<Response> {
   const owner = crypto.randomUUID();
   const lock = await env.DB.prepare("UPDATE cloud_lock SET owner=?,expires_ms=? WHERE singleton=1 AND expires_ms<? RETURNING owner")
@@ -153,7 +122,9 @@ function packDigestBlocks(blocks: string[], limit = 3400): string[] {
   let current = "";
   for (const block of blocks) {
     const candidate = current ? `${current}\n\n${block}` : block;
-    if (current && candidate.length > limit) { messages.push(current); current = block; }
+    // Reserve space for pending/error labels and remaining-work totals in future edits.
+    const editSize = candidate.length + [...candidate.matchAll(/^☐ <code>#/gm)].length * 72 + 160;
+    if (current && editSize > limit) { messages.push(current); current = block; }
     else current = candidate;
   }
   if (current) messages.push(current);
@@ -235,27 +206,11 @@ export function renderDigest(data: BridgeSnapshot, now = new Date()): string[] {
   return [...messages, ...packDigestBlocks(compact)];
 }
 
-async function flush(env: Env): Promise<void> {
-  const rows = await env.DB.prepare("SELECT * FROM cloud_outbox WHERE delivered_at IS NULL ORDER BY created_at,id LIMIT 2").all<{
-    id: string; sealed_chunks: string; next_chunk: number;
-  }>();
-  let budget = 3;
-  for (const row of rows.results) {
-    const chunks = await unseal(env, row.id, row.sealed_chunks);
-    for (let i = row.next_chunk; i < chunks.length; i++) {
-      if (--budget < 0) return;
-      try { await telegramSend(env, chunks[i]); } catch { return; }
-      await env.DB.prepare("UPDATE cloud_outbox SET next_chunk=?,delivered_at=? WHERE id=?")
-        .bind(i + 1, i + 1 === chunks.length ? new Date().toISOString() : null, row.id).run();
-    }
-  }
-}
-
 async function webhook(request: Request, env: Env): Promise<Response> {
   if (!env.TELEGRAM_WEBHOOK_SECRET || request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.TELEGRAM_WEBHOOK_SECRET) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  const update = await request.json() as { update_id?: number; message?: { chat?: { id?: number; type?: string }; from?: { is_bot?: boolean }; text?: string } };
+  const update = await request.json() as { update_id?: number; message?: { message_id?: number; date?: number; chat?: { id?: number; type?: string }; from?: { is_bot?: boolean }; text?: string } };
   const message = update.message;
   if (!Number.isSafeInteger(update.update_id) || !message || message.chat?.type !== "private"
     || String(message.chat?.id) !== env.TELEGRAM_CHAT_ID || message.from?.is_bot || typeof message.text !== "string") return Response.json({ ok: true });
@@ -293,7 +248,6 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     } else {
       pending = mailboxActions.includes(cmd.action);
       chunks = [`⏳ /${cmd.action} queued. It will complete when the Windows Outlook bridge connects.`];
-      if (cmd.action === "list") chunks.push(...renderDigest(data));
     }
     const event = env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,task_ids,retry_limit,status,created_at) VALUES(?,?,?,?,?,?)")
       .bind(key, cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
@@ -302,7 +256,12 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       for (const id of ids) statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=(SELECT id FROM cloud_events WHERE dedupe_key=?) WHERE id=?")
         .bind(cmd.action === "waiting" ? "waiting" : "open", key, id));
     }
-    statements.push(await outbox(env, chunks));
+    if (cmd && data && !missing.length && ["read", "done", "dismiss", "waiting", "reopen"].includes(cmd.action)) {
+      statements.push(await taskFeedback(env, key, ids,
+        { message: message.message_id!, date: message.date! }));
+    } else if (cmd?.action === "list" && data) {
+      statements.push(...await digestOutbox(env, renderDigest(data), chunks));
+    } else statements.push(await outbox(env, chunks));
     await env.DB.batch(statements);
     await flush(env);
     return Response.json({ ok: true });
@@ -354,6 +313,10 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
     const statements: D1PreparedStatement[] = [];
     if (body.task_id !== undefined) {
       if (!ids.includes(body.task_id) || !["read", "done", "dismiss"].includes(event.action)) return Response.json({ error: "Task not in command" }, { status: 400 });
+      if (completed.includes(body.task_id) && !body.failed) {
+        await flush(env);
+        return Response.json({ ok: true });
+      }
       if (!completed.includes(body.task_id)) completed.push(body.task_id);
       if (event.action !== "read") statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=? WHERE id=? AND revision<=?")
         .bind(event.action === "done" ? "done" : "dismissed", event.id, body.task_id, event.id));
@@ -371,11 +334,16 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
         message += `\n${["processed", "skipped", "failed", "unchanged"].map(k => `${k}=${Number.isSafeInteger(counts[k]) ? counts[k] : 0}`).join(" ")}`;
       }
       const chunks = textChunks(message);
-      if (!body.failed && event.action === "list") {
-        const data = await snapshot(env);
-        if (data) chunks.push(...renderDigest(data));
+      if (body.failed || !["read", "done", "dismiss"].includes(event.action)) {
+        if (!body.failed && event.action === "list") {
+          const data = await snapshot(env);
+          if (data) statements.push(...await digestOutbox(env, renderDigest(data), chunks));
+          else statements.push(await outbox(env, chunks));
+        } else statements.push(await outbox(env, chunks));
       }
-      statements.push(await outbox(env, chunks));
+    }
+    if (["read", "done", "dismiss"].includes(event.action)) {
+      statements.push(await taskFeedback(env, event.id, ids, undefined, !body.failed));
     }
     if (statements.length) await env.DB.batch(statements);
     await flush(env);
@@ -408,16 +376,24 @@ export async function runCloudScheduled(env: Env, now = new Date()): Promise<voi
     const key = `digest:${clock.date}`;
     if (clock.hour >= 8 && !await env.DB.prepare("SELECT id FROM cloud_events WHERE dedupe_key=?").bind(key).first()) {
       const data = await snapshot(env);
-      const chunks = data ? renderDigest(data, now) : ["No bridge snapshot yet. The daily digest will become available after Windows publishes one."];
-      await env.DB.batch([
-        env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,status,created_at) VALUES(?,'digest','done',?)").bind(key, now.toISOString()),
-        await outbox(env, chunks),
-      ]);
+      const statements = [env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,status,created_at) VALUES(?,'digest','done',?)")
+        .bind(key, now.toISOString())];
+      if (data) statements.push(...await digestOutbox(env, renderDigest(data, now)));
+      else statements.push(await outbox(env, ["No bridge snapshot yet. The daily digest will become available after Windows publishes one."]));
+      await env.DB.batch(statements);
     }
     await flush(env);
     // Keep update deduplication tombstones, but discard old encrypted delivered responses.
     await env.DB.prepare("DELETE FROM cloud_outbox WHERE delivered_at IS NOT NULL AND delivered_at<?")
       .bind(new Date(now.getTime() - 30 * 86400000).toISOString()).run();
+    // Pending operations can still reference older layouts. Keep them until the queue drains.
+    if (!await env.DB.prepare("SELECT id FROM cloud_outbox WHERE delivered_at IS NULL LIMIT 1").first()) {
+      const cutoff = new Date(now.getTime() - 30 * 86400000).toISOString();
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM cloud_digest_messages WHERE digest_id IN (SELECT id FROM cloud_digests WHERE created_at<?)").bind(cutoff),
+        env.DB.prepare("DELETE FROM cloud_digests WHERE created_at<?").bind(cutoff),
+      ]);
+    }
     return Response.json({ ok: true });
   });
 }
