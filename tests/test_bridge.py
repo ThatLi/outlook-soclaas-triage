@@ -1,3 +1,4 @@
+import base64
 import logging
 from dataclasses import replace
 from datetime import datetime
@@ -9,6 +10,10 @@ from outlook_triage.database import Database
 from outlook_triage.models import EmailClassification
 from outlook_triage.outlook import OutlookError
 from outlook_triage.relay import RelayError, decrypt_payload
+
+
+# Public, deterministic test vector; never a deployed encryption credential.
+TEST_ENCRYPTION_KEY = bytes(range(32))
 
 
 class Client:
@@ -35,7 +40,8 @@ class Client:
 @pytest.fixture
 def bridge(settings):
     config = replace(settings, relay_url="https://cloud.test", relay_token="token",
-                     relay_encryption_key="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", cloud_bot_enabled=True)
+                     relay_encryption_key=base64.urlsafe_b64encode(TEST_ENCRYPTION_KEY).rstrip(b"=").decode("ascii"),
+                     cloud_bot_enabled=True)
     db = Database(config.database_file)
     initialize_bridge(db)
     for number in (1, 2):
@@ -111,7 +117,7 @@ def test_four_hour_slots_catch_up_and_mirror_cloud_state(bridge):
                      now=datetime(2026, 10, 21, hour, tzinfo=config.timezone))
     assert len(calls) == 3  # catch-up 01:00, then 04:00 and 08:00
     assert db.task_email(1)["task_status"] == "waiting"
-    payload = decrypt_payload(client.envelopes[-1], bytes(range(32)))
+    payload = decrypt_payload(client.envelopes[-1], TEST_ENCRYPTION_KEY)
     assert next(task for task in payload["bridge"]["tasks"] if task["id"] == 1)["status"] == "waiting"
     assert all("preview" not in task for task in payload["bridge"]["tasks"])
 
@@ -124,7 +130,7 @@ def test_previews_are_bounded_and_opt_in(bridge):
         def __exit__(self, *args): pass
         def get_body_preview(self, source, store, limit): return ("private " * 5000)[:limit]
     publish_bridge(db, config, client, cache_previews=True, outlook_factory=Outlook)
-    payload = decrypt_payload(client.envelopes[0], bytes(range(32)))
+    payload = decrypt_payload(client.envelopes[0], TEST_ENCRYPTION_KEY)
     assert len(payload["bridge"]["tasks"][0]["preview"]) == 6000
     assert "private " not in str(client.envelopes[0])
 

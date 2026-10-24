@@ -33,10 +33,11 @@ class SQLiteD1 {
 }
 
 const dataset = "00000000-0000-4000-8000-000000000001";
+// Public test vector shared with Python's bytes(range(32)), not a deployed key.
 const keyBytes = Uint8Array.from({ length: 32 }, (_, i) => i);
-const encodedKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const b64 = (bytes: Uint8Array) => btoa(Array.from(bytes, b => String.fromCharCode(b)).join(""))
   .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const encodedKey = b64(keyBytes);
 function fixture(): BridgeSnapshot {
   return {
     dataset_id: dataset, horizon_days: 7,
