@@ -1,5 +1,9 @@
 # Cloudflare Telegram Relay
 
+For two-way commands and cloud task state, use the
+[Cloud Bot and Outlook Bridge guide](Cloud-Bot.md). `CLOUD_BOT_ENABLED` selects
+one mode; only the selected mode sends scheduled digests.
+
 This optional phase-one relay sends the newest digest prepared on Windows at 08:00 Asia/Singapore even if Windows is then off. It does not access Outlook, classify messages, receive Telegram commands, or make cloud state authoritative.
 
 The local application formats the digest and future cached command views, encrypts the complete payload with AES-256-GCM, and uploads only ciphertext plus routing timestamps. Cloudflare decrypts the frozen bundle only when sending it to Telegram. D1 retains the newest bundle indefinitely, removes superseded unreferenced bundles after seven days, and removes completed delivery records after 30 days.

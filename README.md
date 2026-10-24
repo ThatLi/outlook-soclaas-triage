@@ -6,6 +6,11 @@ It does not require Microsoft Entra app registration. It never sends, moves, fla
 
 For daily operation, the complete command reference, scheduling, Telegram delivery, and troubleshooting, see the [User Guide](docs/User-Guide.md).
 
+For commands that stay available while Windows is off, see the
+[Cloud Bot and Outlook Bridge guide](docs/Cloud-Bot.md). It uses Cloudflare Free
+without Entra registration or Power Automate. Mailbox operations wait for the
+Windows bridge; cloud task management and digest delivery remain available.
+
 ## Requirements
 
 - Windows 10 or 11.
