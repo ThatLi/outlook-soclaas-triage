@@ -5,7 +5,7 @@ import { TelegramFailure, telegramRequest } from "./telegram-api";
 
 export interface DigestRow {
   id: string; digest_date: string; message_id: number | null; view: string; page: number;
-  sealed_pages: string; dirty: number; disabled: number; retry_at: number;
+  sealed_pages: string; dirty: number; disabled: number; retry_at: number; last_payload_sha256: string | null;
 }
 export interface DigestCallback {
   id?: string; data?: string; from?: { id?: number; is_bot?: boolean };
@@ -60,14 +60,20 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
   // Save the last generated edition even when Telegram is temporarily unavailable.
   await env.DB.prepare("UPDATE interactive_digests SET sealed_pages=?,page=? WHERE id=?")
     .bind(await seal(env, row.id, pages), page, row.id).run();
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(payload)));
+  const fingerprint = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
+  if (row.message_id !== null && row.last_payload_sha256 === fingerprint) {
+    await env.DB.prepare("UPDATE interactive_digests SET dirty=0,retry_at=0 WHERE id=?").bind(row.id).run();
+    return true;
+  }
   try {
     const result = await telegramRequest(env, row.message_id === null ? "sendMessage" : "editMessageText", {
       chat_id: env.TELEGRAM_CHAT_ID, ...(row.message_id === null ? {} : { message_id: row.message_id }), ...payload,
     });
     const messageId = row.message_id ?? result.message_id;
     if (!Number.isSafeInteger(messageId)) throw new Error("Telegram did not return a message ID");
-    await env.DB.prepare("UPDATE interactive_digests SET message_id=?,dirty=0,retry_at=0 WHERE id=?")
-      .bind(messageId!, row.id).run();
+    await env.DB.prepare("UPDATE interactive_digests SET message_id=?,dirty=0,retry_at=0,last_payload_sha256=? WHERE id=?")
+      .bind(messageId!, fingerprint, row.id).run();
     return true;
   } catch (error) {
     const failure = error instanceof TelegramFailure ? error : null;

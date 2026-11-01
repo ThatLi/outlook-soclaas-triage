@@ -177,3 +177,15 @@ def test_bridge_lock_recovers_a_dead_process_but_keeps_a_live_owner(tmp_path):
         with pytest.raises(AlreadyRunning):
             with process_lock(lock, recover_dead_owner=True):
                 pytest.fail("An active bridge owner was displaced")
+
+
+def test_listener_polls_every_five_seconds(settings, monkeypatch):
+    from outlook_triage import bridge
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    (settings.state_dir / "cloud-bridge.lock").mkdir()
+    cycles = []
+    delays = []
+    monkeypatch.setattr(bridge, "bridge_cycle", lambda *args, **kwargs: cycles.append(True))
+    bridge.listen_bridge(None, settings, logging.getLogger(), sleep=delays.append, max_cycles=2)
+    assert len(cycles) == 2
+    assert delays == [5, 5]

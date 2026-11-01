@@ -25,13 +25,13 @@ failure keeps earlier successes. `/read` leaves task state unchanged. `/done` an
 `/reopen` commands take precedence over older queued completions. Repeated
 Telegram update IDs never create a second command.
 
-The bridge polls every 30 seconds and synchronizes once per Singapore-time
+The bridge polls every five seconds and synchronizes once per Singapore-time
 four-hour slot: **00:00, 04:00, 08:00, 12:00, 16:00, 20:00**. Starting or resuming
 it catches up in the current slot without replaying missed slots. Explicit `/sync`
 and `/list` bypass this interval. Scheduled sync failure is retried next slot;
 send `/sync` for an earlier retry.
 
-Cloud Cron runs every five minutes and sends the daily digest at the first run at
+Cloud Cron runs every minute and sends the daily digest at the first run at
 or after **08:00 Asia/Singapore**, without waiting for Windows. It uses the latest
 mailbox snapshot and current cloud task states. Sync timestamps and classification
 warnings remain visible. Category totals describe the 24-hour window at snapshot
@@ -49,6 +49,8 @@ digest; command queue/completion acknowledgements are still separate messages.
 Failed edits retry on later bot, bridge or scheduled runs. Telegram rate limits
 can delay updates. Deleted or inaccessible digest messages are retired without
 blocking other deliveries.
+Unchanged visible text and buttons do not trigger a Telegram edit; saved pages
+still refresh so navigating to another section shows current content.
 
 For the interactive-digest upgrade, apply migration `0003_interactive_digests.sql`
 with `npx wrangler d1 migrations apply outlook-triage-relay --remote` before
@@ -57,6 +59,8 @@ Python installation to preserve message updates and enable `callback_query`
 updates without discarding pending updates. Existing queued chunk deliveries
 retain their progress. The old sample navigation-trial buttons are retired.
 The migration is additive; retain the new tables when rolling back the Worker.
+For the faster-update upgrade, also apply `0004_digest_payload_hash.sql`, deploy
+the updated Worker, and restart Cloud Bridge to load the five-second interval.
 
 ## Cutover
 

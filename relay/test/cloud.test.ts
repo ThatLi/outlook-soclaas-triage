@@ -13,6 +13,7 @@ class SQLiteD1 {
     this.db.exec(readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0002_cloud_bot.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0003_interactive_digests.sql", import.meta.url), "utf8"));
+    this.db.exec(readFileSync(new URL("../migrations/0004_digest_payload_hash.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) {
     let args: (string | number | null)[] = [];
@@ -126,6 +127,52 @@ beforeEach(async () => {
 afterEach(() => { database.db.close(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("interactive digests", () => {
+  it("skips unchanged visible messages while saving refreshed off-screen pages", async () => {
+    await command("/list");
+    const row = digestRows()[0];
+    expect(row.last_payload_sha256).toMatch(/^[a-f0-9]{64}$/);
+    telegramCalls = [];
+    const data = fixture(); data.tasks[0].description = "New off-screen description";
+    await publish(data);
+    expect(telegramCalls.filter(c => c.method === "editMessageText")).toHaveLength(0);
+    expect((await storedPages(digestRows()[0])).join("\n")).toContain("New off-screen description");
+    expect(digestRows()[0].last_payload_sha256).toBe(row.last_payload_sha256);
+    await callback(row, "outlook");
+    expect(telegramCalls.at(-1)?.body.text).toContain("New off-screen description");
+    const count = telegramCalls.filter(c => c.method === "editMessageText").length;
+    await callback(row, "outlook");
+    expect(telegramCalls.filter(c => c.method === "editMessageText")).toHaveLength(count);
+    expect(telegramCalls.at(-1)?.method).toBe("answerCallbackQuery");
+  });
+  it("updates a legacy message once when no successful payload hash is recorded", async () => {
+    await command("/list");
+    await database.prepare("UPDATE interactive_digests SET last_payload_sha256=NULL,dirty=1").run();
+    telegramCalls = []; await poll();
+    expect(telegramCalls.filter(c => c.method === "editMessageText")).toHaveLength(1);
+    telegramCalls = []; await publish();
+    expect(telegramCalls.filter(c => c.method === "editMessageText")).toHaveLength(0);
+  });
+  it("does not remember a failed edit as successfully displayed", async () => {
+    await command("/list"); const before = digestRows()[0].last_payload_sha256;
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ ok: false }, { status: 503 })));
+    await command("/waiting #1");
+    expect(digestRows()[0].last_payload_sha256).toBe(before);
+    vi.setSystemTime(new Date(Date.now() + 6000)); vi.stubGlobal("fetch", telegramMock());
+    await poll();
+    expect(digestRows()[0].last_payload_sha256).not.toBe(before);
+    expect(digestRows()[0].dirty).toBe(0);
+  });
+  it("retries a pending edit at the next minute without sending another daily digest", async () => {
+    await runCloudScheduled(env);
+    await callback(digestRows()[0], "outlook");
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ ok: false }, { status: 503 })));
+    await command("/waiting #1");
+    vi.setSystemTime(new Date(Date.now() + 60000)); vi.stubGlobal("fetch", telegramMock());
+    await runCloudScheduled(env);
+    expect(digestRows()).toHaveLength(1);
+    expect(digestRows()[0].dirty).toBe(0);
+    expect(telegramCalls.filter(c => c.method === "sendMessage" && c.body.reply_markup)).toHaveLength(1);
+  });
   it("sends one digest per list and edits it on bridge completion", async () => {
     await command("/list");
     const row = digestRows()[0];
@@ -136,7 +183,8 @@ describe("interactive digests", () => {
     await ack({ event_id: job.id });
     expect(digestRows()).toHaveLength(1);
     expect(telegramCalls.filter(c => c.method === "sendMessage" && c.body.reply_markup)).toHaveLength(1);
-    expect(telegramCalls.some(c => c.method === "editMessageText" && c.body.message_id === row.message_id)).toBe(true);
+    expect(telegramCalls.filter(c => c.method === "editMessageText")).toHaveLength(0);
+    expect(digestRows()[0].dirty).toBe(0);
   });
   it("uses the exact news placeholder and acknowledges repeated navigation taps", async () => {
     await command("/list");
@@ -171,9 +219,10 @@ describe("interactive digests", () => {
     telegramCalls = [];
     await command("/waiting #1");
     const edits = telegramCalls.filter(c => c.method === "editMessageText");
-    expect(edits).toHaveLength(2);
+    expect(edits).toHaveLength(1);
     expect(edits.find(c => c.body.message_id === first.message_id)?.body.text).toContain("WAITING / FOLLOW-UP");
-    expect(edits.find(c => c.body.message_id === second.message_id)?.body.text).toContain("not implemented yet");
+    expect(edits.some(c => c.body.message_id === second.message_id)).toBe(false);
+    expect((await storedPages(digestRows().find(r => r.id === second.id)!)).join("\n")).toContain("WAITING / FOLLOW-UP");
     expect((await storedPages(digestRows()[0])).join("\n")).toContain("WAITING / FOLLOW-UP");
     await command("/reopen #1");
     expect((await storedPages(digestRows()[0])).join("\n")).not.toContain("<b>WAITING / FOLLOW-UP");
