@@ -539,7 +539,7 @@ describe("interactive digests", () => {
     await publish(data);
     expect(digestRows()[0].view).toBe("outlook"); expect(digestRows()[0].page).toBe(0);
     const edit = telegramCalls.filter(c => c.method === "editMessageText").at(-1)!;
-    expect(edit.body.text).toContain("Page 1 of 1");
+    expect(edit.body.text).toContain("Daily brief — 2026-11-01 (Page 1 / 1)</b>");
     expect(JSON.stringify(edit.body.reply_markup)).not.toMatch(/Previous|Next/);
   });
   it("retries refresh failures and respects Telegram retry delays without losing mutations", async () => {
@@ -713,6 +713,13 @@ describe("cloud bot with real SQLite", () => {
 });
 
 describe("command and rendering contracts", () => {
+  it("puts Outlook pagination in the daily heading without a second Outlook heading", () => {
+    const row = { id: crypto.randomUUID(), digest_date: "2026-11-02", view: "outlook", page: 1 };
+    const pages = ["Overview content", "First section", "Second section", "Third section", "Fourth section"];
+    expect(digestMessage(row, pages).payload.text).toBe("📬 <b>Daily brief — 2026-11-02 (Page 2 / 4)</b>\n\nSecond section");
+    for (const view of ["overview", "news"]) expect(digestMessage({ ...row, view }, pages).payload.text.split("\n")[0])
+      .toBe("📬 <b>Daily brief — 2026-11-02</b>");
+  });
   it("separates immediate urgency sections and combines only the two lower-priority sections", () => {
     const pages = renderDigest(allSectionsFixture());
     expect(pages).toHaveLength(5);

@@ -25,13 +25,14 @@ export function digestMessage(row: Pick<DigestRow, "id" | "digest_date" | "view"
   let content = pages[0];
   if (row.view === "news") content = "📰 <b>News</b>\n\nnot implemented yet";
   if (row.view === "outlook") {
-    content = `📬 <b>Outlook · Page ${page + 1} of ${count}</b>\n\n${pages[page + 1] ?? "No active tasks."}`;
+    content = pages[page + 1] ?? "No active tasks.";
     const navigation = [];
     if (page > 0) navigation.push(button("← Previous", "outlook", page - 1));
     if (page + 1 < count) navigation.push(button("Next →", "outlook", page + 1));
     if (navigation.length) rows.unshift(navigation);
   }
-  return { page, payload: { text: `📬 <b>Daily brief — ${row.digest_date}</b>\n\n${content}${feedback ? `\n\n${feedback}` : ""}`, parse_mode: "HTML",
+  const pagination = row.view === "outlook" ? ` (Page ${page + 1} / ${count})` : "";
+  return { page, payload: { text: `📬 <b>Daily brief — ${row.digest_date}${pagination}</b>\n\n${content}${feedback ? `\n\n${feedback}` : ""}`, parse_mode: "HTML",
     disable_web_page_preview: true, reply_markup: { inline_keyboard: rows } } };
 }
 
