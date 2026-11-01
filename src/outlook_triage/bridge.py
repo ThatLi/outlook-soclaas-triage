@@ -212,4 +212,4 @@ def listen_bridge(db: Database, settings: Settings, logger: logging.Logger, *, c
             bridge_cycle(db, settings, logger, cache_previews=cache_previews)
         except (RelayError, AlreadyRunning) as exc:
             logger.warning("Cloud bridge will retry (%s)", type(exc).__name__)
-        sleep(30)
+        sleep(5)

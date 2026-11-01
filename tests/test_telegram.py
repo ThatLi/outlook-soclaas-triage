@@ -160,6 +160,13 @@ def test_webhook_info_returns_mapping():
     assert TelegramClient("secret", session=session).webhook_info() == {"url": ""}
 
 
+def test_set_webhook_preserves_messages_and_enables_button_callbacks():
+    session = Session([Response()])
+    TelegramClient("secret", session=session).set_webhook("https://example.com/telegram/webhook", "a" * 32)
+    assert session.calls[0][1]["allowed_updates"] == '["message", "callback_query"]'
+    assert session.calls[0][1]["drop_pending_updates"] is False
+
+
 def test_set_commands_registers_telegram_menu():
     session = Session([Response()])
     TelegramClient("secret", session=session).set_commands((("list", "Show digest"), ("help", "Show help")))

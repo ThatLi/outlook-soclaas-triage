@@ -497,7 +497,7 @@ class TelegramClient:
         if not url.startswith("https://") or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", secret):
             raise TelegramError("Webhook requires HTTPS and a 32-256 character independent secret", category="configuration")
         self._request("setWebhook", {"url": url, "secret_token": secret,
-                                     "allowed_updates": '["message"]', "max_connections": 1,
+                                     "allowed_updates": '["message", "callback_query"]', "max_connections": 1,
                                      "drop_pending_updates": False})
 
     def delete_webhook(self) -> None:
