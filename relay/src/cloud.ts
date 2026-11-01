@@ -2,8 +2,9 @@ import {
   decryptEnvelope, escapeHtml, singaporeClock, telegramSend, validateEnvelope,
   type BundlePayload, type Env,
 } from "./index";
-import { deliverDigest, digestCallback, dirtyDigests, queueDigest, refreshDigests, type DigestCallback, type DigestRow } from "./interactive-digest";
+import { deliverDigest, digestCallback, dirtyDigests, ensureDigestLayouts, queueDigest, refreshDigests, type DigestCallback, type DigestRow } from "./interactive-digest";
 import { TelegramFailure } from "./telegram-api";
+import { flushFeedback, taskFeedback, type DigestGroup } from "./task-feedback";
 
 type Status = "open" | "waiting" | "done" | "dismissed";
 export interface CloudTask {
@@ -150,7 +151,7 @@ export async function snapshot(env: Env): Promise<BridgeSnapshot | null> {
   return { ...data, tasks: data.tasks.map(t => ({ ...t, status: lookup.get(t.id) ?? t.status })) };
 }
 
-function packDigestBlocks(blocks: string[], limit = 3200): string[] {
+function packDigestBlocks(blocks: string[], limit = 3000): string[] {
   const messages: string[] = [];
   let current = "";
   for (const block of blocks) {
@@ -162,10 +163,10 @@ function packDigestBlocks(blocks: string[], limit = 3200): string[] {
   return messages;
 }
 
-function digestTaskParts(task: CloudTask, today: string): string[] {
+function digestTaskParts(task: CloudTask, today: string, annotation = ""): string[] {
   const id = `<code>#${task.id}</code>`;
   const parts = textChunks(task.description, 1800).map((description, index) =>
-    `${index ? "↳" : "☐"} ${id}${index ? " <i>(continued)</i>" : ""} ${description}`);
+    `${index ? "↳" : task.status === "done" ? "☑" : task.status === "dismissed" ? "☒" : "☐"} ${id}${index ? " <i>(continued)</i>" : annotation} ${description}`);
   const metadata: string[] = [];
   if (task.deadline) {
     const label = task.deadline === today ? "today" : new Intl.DateTimeFormat("en-GB", {
@@ -177,25 +178,30 @@ function digestTaskParts(task: CloudTask, today: string): string[] {
   if (sender) metadata.push(...textChunks(sender, 1000).map(piece => `<i>${piece}</i>`));
   for (const line of metadata) {
     const last = parts.length - 1;
-    if (parts[last].length + line.length + 2 <= 3000) parts[last] += `\n ${line}`;
+    if (parts[last].length + line.length + 2 <= 2700) parts[last] += `\n ${line}`;
     else parts.push(`↳ ${id}\n ${line}`);
   }
   return parts;
 }
 
-function digestSection(heading: string, emoji: string, tasks: CloudTask[], today: string): string[] {
+function remainingLabel(tasks: CloudTask[]): string {
+  const active = tasks.filter(task => ["open", "waiting"].includes(task.status)).length;
+  return active === tasks.length ? String(active) : `${active} remaining / ${tasks.length}`;
+}
+
+function digestSection(heading: string, emoji: string, tasks: CloudTask[], today: string, annotations: Map<number, string>): string[] {
   if (!tasks.length) return [];
-  const title = `${emoji} <b>${escapeHtml(heading.toUpperCase())} · ${tasks.length}</b>`;
+  const title = `${emoji} <b>${escapeHtml(heading.toUpperCase())} · ${remainingLabel(tasks)}</b>`;
   // Split only at complete rendered fragments. Each fragment has balanced HTML,
   // including repeated task IDs when a long description needs continuation.
-  const groups = packDigestBlocks(tasks.flatMap(task => digestTaskParts(task, today)), 3200 - title.length - 60);
+  const groups = packDigestBlocks(tasks.flatMap(task => digestTaskParts(task, today, annotations.get(task.id))), 3000 - title.length - 60);
   return groups.map((group, index) => `${title}${groups.length > 1 ? ` — PART ${index + 1} OF ${groups.length}` : ""}\n\n${group}`);
 }
 
-export function renderDigest(data: BridgeSnapshot, now = new Date()): string[] {
+export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>()): string[] {
   const today = singaporeClock(now).date;
   const horizon = new Date(Date.parse(today) + data.horizon_days * 86400000).toISOString().slice(0, 10);
-  const groups: [string, CloudTask[]][] = [
+  let groups: [string, CloudTask[]][] = [
     ["Overdue", []], ["Urgent / due today", []], [`Due within ${data.horizon_days} days`, []],
     ["Other open actions", []], ["Waiting / follow-up", []],
   ];
@@ -209,11 +215,15 @@ export function renderDigest(data: BridgeSnapshot, now = new Date()): string[] {
     else group = 3;
     groups[group][1].push(task);
   }
+  if (fixedGroups) {
+    const lookup = new Map(data.tasks.map(task => [task.id, task]));
+    groups = fixedGroups.map(group => [group.heading, group.ids.map(id => lookup.get(id)).filter((task): task is CloudTask => Boolean(task))]);
+  }
   const emojis = ["🔴", "🟠", "🟡", "⚪", "💤"];
   const summary = [
     `📬 <b>Inbox brief — ${today}</b>`,
     ["<b>OPEN ACTIONS</b>", ...groups.map(([heading, tasks], index) =>
-      `${emojis[index]} ${escapeHtml(heading)}: <b>${tasks.length}</b>`)].join("\n"),
+      `${emojis[index]} ${escapeHtml(heading)}: <b>${remainingLabel(tasks)}</b>`)].join("\n"),
   ];
   const sync = ["🔄 <b>SYNCHRONIZATION</b>",
     ...textChunks(data.health.last_sync ?? "never", 2000).map(value => `Last successful Outlook sync: <b>${value}</b>`),
@@ -226,7 +236,7 @@ export function renderDigest(data: BridgeSnapshot, now = new Date()): string[] {
   }
   summary.push(activity.join("\n"), ...sync);
   const messages = packDigestBlocks(summary);
-  const sections = groups.map(([heading, tasks], index) => digestSection(heading, emojis[index], tasks, today));
+  const sections = groups.map(([heading, tasks], index) => digestSection(heading, emojis[index], tasks, today, annotations));
   let compact: string[] = [];
   for (const parts of sections) {
     if (parts.length > 1) {
@@ -242,6 +252,7 @@ async function flush(env: Env, now = new Date()): Promise<void> {
   const pause = await env.DB.prepare("SELECT telegram_retry_at FROM cloud_lock WHERE singleton=1").first<{ telegram_retry_at: number }>();
   if (pause && pause.telegram_retry_at > Date.now()) return;
   await refreshDigests(env, now);
+  await flushFeedback(env);
   const afterRefresh = await env.DB.prepare("SELECT telegram_retry_at FROM cloud_lock WHERE singleton=1").first<{ telegram_retry_at: number }>();
   if (afterRefresh && afterRefresh.telegram_retry_at > Date.now()) return;
   const rows = await env.DB.prepare("SELECT * FROM cloud_outbox WHERE delivered_at IS NULL ORDER BY created_at,id LIMIT 2").all<{
@@ -273,7 +284,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   if (!env.TELEGRAM_WEBHOOK_SECRET || request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.TELEGRAM_WEBHOOK_SECRET) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  const update = await request.json() as { update_id?: number; callback_query?: DigestCallback; message?: { chat?: { id?: number; type?: string }; from?: { is_bot?: boolean }; text?: string } };
+  const update = await request.json() as { update_id?: number; callback_query?: DigestCallback; message?: { message_id?: number; date?: number; chat?: { id?: number; type?: string }; from?: { is_bot?: boolean }; text?: string } };
   if (Number.isSafeInteger(update.update_id) && update.callback_query) return withLock(env, () => digestCallback(update.callback_query!, env));
   const message = update.message;
   if (!Number.isSafeInteger(update.update_id) || !message || message.chat?.type !== "private"
@@ -289,6 +300,8 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     if (data?.processed_telegram_updates?.includes(update.update_id!)) return Response.json({ ok: true });
     const ids = cmd?.ids ?? [];
     const missing = ids.filter(id => !data?.tasks.some(t => t.id === id));
+    const quiet = Boolean(cmd && data && !missing.length && ["read", "done", "dismiss", "waiting", "reopen"].includes(cmd.action));
+    if (quiet) await ensureDigestLayouts(env, data!);
     let chunks: string[];
     let pending = false;
     if (!cmd) chunks = ["Unknown command or invalid arguments. Use /help."];
@@ -314,7 +327,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       chunks = [`⏳ /${cmd.action} queued. It will complete when the Windows Outlook bridge connects.`];
     }
     const event = env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,task_ids,retry_limit,status,created_at) VALUES(?,?,?,?,?,?)")
-      .bind(key, cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
+      .bind(key, missing.length ? "invalid" : cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
     const statements = [event];
     if (cmd && data && !missing.length && ["waiting", "reopen"].includes(cmd.action)) {
       for (const id of ids) statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=(SELECT id FROM cloud_events WHERE dedupe_key=?) WHERE id=?")
@@ -325,7 +338,8 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       const digest = await queueDigest(env);
       statements.push(...digest.statements, env.DB.prepare("UPDATE cloud_events SET digest_id=? WHERE dedupe_key=?").bind(digest.id, key));
     }
-    statements.push(await outbox(env, chunks));
+    if (quiet) statements.push(...await taskFeedback(env, key, ids, { message: message.message_id, date: message.date }));
+    else statements.push(await outbox(env, chunks));
     await env.DB.batch(statements);
     await flush(env);
     return Response.json({ ok: true });
@@ -373,16 +387,16 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
     if (!row || row.dataset_id !== request.headers.get("X-Bridge-Dataset")) return Response.json({ error: "Wrong bridge dataset" }, { status: 409 });
     const event = await env.DB.prepare("SELECT * FROM cloud_events WHERE id=?").bind(body.event_id).first<Event>();
     if (!event) return Response.json({ error: "Unknown command" }, { status: 404 });
-    if (event.status !== "pending") return Response.json({ ok: true });
+    if (event.status !== "pending") { await flush(env); return Response.json({ ok: true }); }
     const ids: number[] = JSON.parse(event.task_ids);
     const completed: number[] = JSON.parse(event.completed_ids);
     const statements: D1PreparedStatement[] = [];
     if (body.task_id !== undefined) {
       if (!ids.includes(body.task_id) || !["read", "done", "dismiss"].includes(event.action)) return Response.json({ error: "Task not in command" }, { status: 400 });
+      if (completed.includes(body.task_id) && !body.failed) { await flush(env); return Response.json({ ok: true }); }
       if (!completed.includes(body.task_id)) completed.push(body.task_id);
       if (event.action !== "read") statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=? WHERE id=? AND revision<=?")
         .bind(event.action === "done" ? "done" : "dismissed", event.id, body.task_id, event.id));
-      if (event.action !== "read") statements.push(dirtyDigests(env));
       statements.push(env.DB.prepare("UPDATE cloud_events SET completed_ids=? WHERE id=?").bind(JSON.stringify(completed), event.id));
     }
     const finished = body.failed || (ids.length ? completed.length === ids.length : body.task_id === undefined);
@@ -399,8 +413,9 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
       const chunks = textChunks(message);
       if (event.action === "list" && event.digest_id) statements.push(env.DB.prepare("UPDATE interactive_digests SET dirty=1 WHERE id=? AND digest_date=? AND disabled=0")
         .bind(event.digest_id, singaporeClock(new Date()).date));
-      statements.push(await outbox(env, chunks));
+      if (body.failed || !["read", "done", "dismiss"].includes(event.action)) statements.push(await outbox(env, chunks));
     }
+    if (["read", "done", "dismiss"].includes(event.action)) statements.push(...await taskFeedback(env, event.id, ids, undefined, !body.failed));
     if (statements.length) await env.DB.batch(statements);
     await flush(env);
     return Response.json({ ok: true });
@@ -441,6 +456,20 @@ export async function runCloudScheduled(env: Env, now = new Date()): Promise<voi
     // Keep update deduplication tombstones, but discard old encrypted delivered responses.
     await env.DB.prepare("DELETE FROM cloud_outbox WHERE delivered_at IS NOT NULL AND delivered_at<?")
       .bind(new Date(now.getTime() - 30 * 86400000).toISOString()).run();
+    await env.DB.prepare("DELETE FROM cloud_task_feedback WHERE delivered_at IS NOT NULL AND created_at<?")
+      .bind(new Date(now.getTime() - 30 * 86400000).toISOString()).run();
+    if (!await env.DB.prepare("SELECT id FROM cloud_outbox WHERE delivered_at IS NULL LIMIT 1").first()
+      && !await env.DB.prepare("SELECT id FROM cloud_task_feedback WHERE delivered_at IS NULL LIMIT 1").first()) {
+      const cutoff = singaporeClock(new Date(now.getTime() - 30 * 86400000)).date;
+      await env.DB.batch([
+        env.DB.prepare("UPDATE cloud_events SET digest_id=NULL WHERE digest_id IN (SELECT id FROM interactive_digests WHERE digest_date<?)").bind(cutoff),
+        env.DB.prepare("DELETE FROM cloud_outbox WHERE digest_id IN (SELECT id FROM interactive_digests WHERE digest_date<?)").bind(cutoff),
+        env.DB.prepare("DELETE FROM interactive_digests WHERE digest_date<?").bind(cutoff),
+        env.DB.prepare("DELETE FROM cloud_digest_messages WHERE digest_id IN (SELECT id FROM cloud_digests WHERE created_at<?)")
+          .bind(new Date(now.getTime() - 30 * 86400000).toISOString()),
+        env.DB.prepare("DELETE FROM cloud_digests WHERE created_at<?").bind(new Date(now.getTime() - 30 * 86400000).toISOString()),
+      ]);
+    }
     return Response.json({ ok: true });
   });
 }

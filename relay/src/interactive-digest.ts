@@ -2,17 +2,22 @@ import type { Env } from "./index";
 import { renderDigest, seal, snapshot, unseal } from "./cloud";
 import { singaporeClock } from "./index";
 import { TelegramFailure, telegramRequest } from "./telegram-api";
+import { annotation, digestGroups, effectiveStates, feedbackLabel, type DigestGroup, type TaskEvent } from "./task-feedback";
+import type { BridgeSnapshot, CloudTask } from "./cloud";
 
 export interface DigestRow {
   id: string; digest_date: string; message_id: number | null; view: string; page: number;
   sealed_pages: string; dirty: number; disabled: number; retry_at: number; last_payload_sha256: string | null;
+  sealed_layout: string | null; task_ids_json: string; feedback_event: number | null;
+  feedback_text: string;
 }
+interface DigestLayout { tasks: CloudTask[]; groups: DigestGroup[] }
 export interface DigestCallback {
   id?: string; data?: string; from?: { id?: number; is_bot?: boolean };
   message?: { message_id?: number; chat?: { id?: number; type?: string } };
 }
 
-export function digestMessage(row: Pick<DigestRow, "id" | "digest_date" | "view" | "page">, pages: string[]) {
+export function digestMessage(row: Pick<DigestRow, "id" | "digest_date" | "view" | "page">, pages: string[], feedback = "") {
   const count = Math.max(1, pages.length - 1);
   const page = Math.min(Math.max(0, row.page), count - 1);
   const button = (text: string, view: string, target = 0) => ({ text, callback_data: `digest:${row.id}:${view}:${target}` });
@@ -26,7 +31,7 @@ export function digestMessage(row: Pick<DigestRow, "id" | "digest_date" | "view"
     if (page + 1 < count) navigation.push(button("Next →", "outlook", page + 1));
     if (navigation.length) rows.unshift(navigation);
   }
-  return { page, payload: { text: `📬 <b>Daily brief — ${row.digest_date}</b>\n\n${content}`, parse_mode: "HTML",
+  return { page, payload: { text: `📬 <b>Daily brief — ${row.digest_date}</b>\n\n${content}${feedback ? `\n\n${feedback}` : ""}`, parse_mode: "HTML",
     disable_web_page_preview: true, reply_markup: { inline_keyboard: rows } } };
 }
 
@@ -34,12 +39,30 @@ export async function queueDigest(env: Env, now = new Date()) {
   const id = crypto.randomUUID();
   const data = await snapshot(env);
   const pages = data ? renderDigest(data, now) : ["No bridge snapshot yet. The digest will become available after Windows publishes one.", "No active tasks."];
+  const groups = digestGroups(pages);
+  const ids = groups.flatMap(group => group.ids);
+  const layout: DigestLayout | null = data ? { tasks: data.tasks.filter(task => ids.includes(task.id)).map(({ preview, ...task }) => task), groups } : null;
   return { id, statements: [
-    env.DB.prepare("INSERT INTO interactive_digests(id,digest_date,sealed_pages) VALUES(?,?,?)")
-      .bind(id, singaporeClock(now).date, await seal(env, id, pages)),
+    env.DB.prepare("INSERT INTO interactive_digests(id,digest_date,sealed_pages,sealed_layout,task_ids_json,dirty) VALUES(?,?,?,?,?,1)")
+      .bind(id, singaporeClock(now).date, await seal(env, id, pages), layout ? await seal(env, id, [JSON.stringify(layout)]) : null, JSON.stringify(ids)),
     env.DB.prepare("INSERT INTO cloud_outbox(id,sealed_chunks,created_at,digest_id) VALUES(?,?,?,?)")
       .bind(id, await seal(env, id, []), now.toISOString(), id),
   ] };
+}
+
+export async function ensureDigestLayouts(env: Env, data: BridgeSnapshot) {
+  const rows = await env.DB.prepare("SELECT * FROM interactive_digests WHERE digest_date=? AND sealed_layout IS NULL AND disabled=0")
+    .bind(singaporeClock(new Date()).date).all<DigestRow>();
+  for (const row of rows.results) {
+    const pages = await unseal(env, row.id, row.sealed_pages);
+    const groups = digestGroups(pages);
+    // A digest sent before the first bridge snapshot can acquire its initial layout.
+    if (!groups.length && pages[0].startsWith("No bridge snapshot")) groups.push(...digestGroups(renderDigest(data)));
+    const ids = groups.flatMap(group => group.ids);
+    const layout: DigestLayout = { tasks: data.tasks.filter(task => ids.includes(task.id)).map(({ preview, ...task }) => task), groups };
+    await env.DB.prepare("UPDATE interactive_digests SET sealed_layout=?,task_ids_json=? WHERE id=?")
+      .bind(await seal(env, row.id, [JSON.stringify(layout)]), JSON.stringify(ids), row.id).run();
+  }
 }
 
 export function dirtyDigests(env: Env) {
@@ -54,12 +77,27 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
   let pages = await unseal(env, row.id, row.sealed_pages);
   if (row.dirty && row.digest_date === singaporeClock(now).date) {
     const data = await snapshot(env);
-    if (data) pages = renderDigest(data, now);
+    if (data) {
+      if (row.sealed_layout === null) {
+        await ensureDigestLayouts(env, data);
+        const saved = await env.DB.prepare("SELECT sealed_layout FROM interactive_digests WHERE id=?").bind(row.id).first<{ sealed_layout: string }>();
+        row.sealed_layout = saved!.sealed_layout;
+      }
+      const layout: DigestLayout = JSON.parse((await unseal(env, row.id, row.sealed_layout!))[0]);
+      const latest = new Map(data.tasks.map(task => [task.id, task]));
+      const { tasks, events } = await effectiveStates(env);
+      const notes = new Map(layout.tasks.map(task => [task.id, annotation(task.id, tasks.get(task.id), events)]));
+      const updated = layout.tasks.map(task => ({ ...task, ...latest.get(task.id), status: (tasks.get(task.id)?.status ?? task.status) as CloudTask["status"] }));
+      pages = renderDigest({ ...data, tasks: updated }, now, layout.groups, notes);
+    }
   }
-  const { page, payload } = digestMessage(row, pages);
+  const event = row.feedback_event === null || row.digest_date !== singaporeClock(now).date ? null
+    : await env.DB.prepare("SELECT * FROM cloud_events WHERE id=?").bind(row.feedback_event).first<TaskEvent>();
+  const feedback = event ? feedbackLabel(event) : row.feedback_text;
+  const { page, payload } = digestMessage(row, pages, feedback);
   // Save the last generated edition even when Telegram is temporarily unavailable.
-  await env.DB.prepare("UPDATE interactive_digests SET sealed_pages=?,page=? WHERE id=?")
-    .bind(await seal(env, row.id, pages), page, row.id).run();
+  await env.DB.prepare("UPDATE interactive_digests SET sealed_pages=?,page=?,feedback_text=? WHERE id=?")
+    .bind(await seal(env, row.id, pages), page, feedback, row.id).run();
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(payload)));
   const fingerprint = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
   if (row.message_id !== null && row.last_payload_sha256 === fingerprint) {

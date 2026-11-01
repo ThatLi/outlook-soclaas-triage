@@ -12,12 +12,13 @@ export async function telegramRequest(env: Env, method: string, body: object): P
     body: JSON.stringify(body),
   });
   const result = await response.json().catch(() => null) as {
-    ok?: boolean; result?: { message_id?: number }; description?: string; parameters?: { retry_after?: number };
+    ok?: boolean; result?: { message_id?: number }; error_code?: number; description?: string; parameters?: { retry_after?: number };
   } | null;
   const description = result?.description ?? "";
-  if (method === "editMessageText" && response.status === 400 && description.includes("message is not modified")) return {};
-  if (!response.ok || !result?.ok) throw new TelegramFailure(response.status,
-    result?.parameters?.retry_after ?? 0,
-    response.status === 403 || (response.status === 400 && /message to edit not found|message can't be edited|chat not found/.test(description)));
+  const code = result?.error_code ?? response.status;
+  if (method === "editMessageText" && code === 400 && /message is not modified/i.test(description)) return {};
+  if (!response.ok || !result?.ok) throw new TelegramFailure(code,
+    Math.max(0, Number(result?.parameters?.retry_after) || 0),
+    code === 403 || (code === 400 && /message to edit not found|message can't be edited|chat not found/i.test(description)));
   return result.result ?? {};
 }

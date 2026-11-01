@@ -52,6 +52,37 @@ blocking other deliveries.
 Unchanged visible text and buttons do not trigger a Telegram edit; saved pages
 still refresh so navigating to another section shows current content.
 
+### Quiet task feedback (PR #13)
+
+`/done`, `/dismiss`, `/waiting`, `/reopen`, and `/read` show feedback in today's
+interactive digests. Accepted task commands are deleted only after feedback is
+delivered. Invalid commands remain visible. Successful task commands do not send
+separate queued/completed replies when an editable digest covers the tasks.
+Other commands keep their existing replies, and failures remain actionable.
+
+| Task state | Appearance |
+| --- | --- |
+| Open | `☐ #42 Submit report` |
+| Done requested | `☐ #42 · ⏳ Done pending Submit report` |
+| Done confirmed | `☑ #42 Submit report` |
+| Dismissed confirmed | `☒ #42 Submit report` |
+| Waiting | `☐ #42 · 💤 Waiting Submit report` |
+| Read confirmed | `☐ #42 · Email read Submit report` |
+
+Rows stay in their original sections, including completed and dismissed rows;
+totals show remaining open/waiting tasks. A fresh digest regroups tasks and omits
+closed tasks. Snapshot refreshes update the original rows' descriptions and
+metadata. New tasks appear in the next fresh digest. A short feedback footer also
+shows command progress when the selected page does not contain the affected
+tasks, preserving the selected view. Partial successes keep their checkmarks,
+and newer waiting/reopen changes take precedence over older Outlook confirmations.
+
+If no current editable digest contains a task, the bot sends a concise fallback
+reply. Earlier editions, including the old multi-message digests, remain history.
+Command deletion is best effort: commands older than 48 hours and permanently
+rejected deletions are skipped without undoing the action. Transient failures and
+Telegram retry delays preserve pending feedback and cleanup for retry.
+
 For the interactive-digest upgrade, apply migration `0003_interactive_digests.sql`
 with `npx wrangler d1 migrations apply outlook-triage-relay --remote` before
 deploying the Worker. Run `outlook-triage cloud-webhook-enable` with the updated
@@ -61,6 +92,11 @@ retain their progress. The old sample navigation-trial buttons are retired.
 The migration is additive; retain the new tables when rolling back the Worker.
 For the faster-update upgrade, also apply `0004_digest_payload_hash.sql`, deploy
 the updated Worker, and restart Cloud Bridge to load the five-second interval.
+For restored quiet task feedback, apply `0005_quiet_task_feedback.sql` before
+deploying. The original `0003_digest_interactions.sql` migration from PR #13 is
+retained for installations that already applied it. Existing interactive messages
+acquire their retained layout on first refresh; rows removed before this upgrade
+cannot have their original membership reconstructed. No bridge change is needed.
 
 ## Cutover
 
@@ -145,7 +181,10 @@ can duplicate one chunk. Delivered responses are deleted after 30 days, while
 update deduplication records remain. Monitor free-tier storage as history grows.
 After an interrupted process, the bridge verifies the recorded process is dead
 before recovering its lock; it does not displace a live bridge.
-Free-tier resource limits can pause service; no paid plan is enabled or assumed.
+Encrypted digest layouts, message IDs and delivered feedback are retained for
+30 days. Cleanup waits until pending deliveries and feedback have drained;
+command deduplication records remain. Free-tier resource limits can pause service;
+no paid plan is enabled or assumed.
 Permanent Telegram rejection leaves output pending until credentials/chat access
 are corrected. A permanently failing first reply can delay later replies.
 
