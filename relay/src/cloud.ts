@@ -238,8 +238,10 @@ export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups
   summary.push(activity.join("\n"), ...sync);
   const messages = packDigestBlocks(summary);
   const sections = groups.map(([heading, tasks], index) => digestSection(heading, emojis[index], tasks, today, annotations));
+  messages.push(...sections.slice(0, 3).flat());
   let compact: string[] = [];
-  for (const parts of sections) {
+  // Only other actions and waiting/follow-up may share a page.
+  for (const parts of sections.slice(3)) {
     if (parts.length > 1) {
       messages.push(...packDigestBlocks(compact), ...parts);
       compact = [];

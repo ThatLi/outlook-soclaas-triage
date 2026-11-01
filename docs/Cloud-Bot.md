@@ -39,7 +39,11 @@ preparation, even if Windows has been off for days.
 
 Each scheduled digest and `/list` digest is one interactive message. Use
 **Overview**, **Outlook**, and **News** to switch views. Outlook pages show real
-task IDs and only show Previous/Next when another page exists. News currently
+task IDs and only show Previous/Next when another page exists. Overdue,
+urgent/due-today, and upcoming-deadline sections
+each start on separate Outlook pages. Other open actions and waiting/follow-up
+share a page when they fit, retaining separate headings. Oversized sections have
+their own continuation pages; empty sections are omitted. News currently
 shows “not implemented yet”. Keep using typed `/waiting`, `/reopen`, `/done`,
 and `/dismiss` commands: all digests from the current Singapore date update
 automatically, preserving the selected view. `/done` and `/dismiss` update only

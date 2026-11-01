@@ -5,6 +5,7 @@ import worker, { type Env } from "../src/index";
 import { parseCloudCommand, renderDigest, runCloudScheduled, textChunks, type BridgeSnapshot } from "../src/cloud";
 import { digestMessage, type DigestRow } from "../src/interactive-digest";
 import { unseal } from "../src/cloud";
+import { digestGroups } from "../src/task-feedback";
 
 // Run production SQL against SQLite rather than matching SQL strings in a mock.
 class SQLiteD1 {
@@ -55,6 +56,17 @@ function fixture(): BridgeSnapshot {
       urgency: "normal", sender_name: "Example", sender_address: "", subject: "Private subject",
     })),
   };
+}
+function allSectionsFixture(): BridgeSnapshot {
+  const data = fixture();
+  data.tasks = [
+    { ...data.tasks[0], id: 1, deadline: "2026-10-31" },
+    { ...data.tasks[0], id: 2, deadline: "2026-11-01" },
+    { ...data.tasks[0], id: 3, deadline: "2026-11-03" },
+    { ...data.tasks[0], id: 4, deadline: null },
+    { ...data.tasks[0], id: 5, status: "waiting", deadline: null },
+  ];
+  return data;
 }
 async function envelope(data: BridgeSnapshot) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -701,6 +713,78 @@ describe("cloud bot with real SQLite", () => {
 });
 
 describe("command and rendering contracts", () => {
+  it("separates immediate urgency sections and combines only the two lower-priority sections", () => {
+    const pages = renderDigest(allSectionsFixture());
+    expect(pages).toHaveLength(5);
+    expect(pages[0]).toContain("OPEN ACTIONS");
+    expect(pages[1]).toContain("<b>OVERDUE · 1</b>");
+    expect(pages[2]).toContain("<b>URGENT / DUE TODAY · 1</b>");
+    expect(pages[3]).toContain("<b>DUE WITHIN 7 DAYS · 1</b>");
+    expect(pages[4]).toContain("<b>OTHER OPEN ACTIONS · 1</b>");
+    expect(pages[4]).toContain("<b>WAITING / FOLLOW-UP · 1</b>");
+    for (let index = 1; index <= 3; index++) {
+      expect([...pages[index].matchAll(/^[🔴🟠🟡⚪💤]+ <b>/gmu)]).toHaveLength(1);
+      expect([...pages[index].matchAll(/<code>#(\d+)<\/code>/g)].map(match => Number(match[1]))).toEqual([index]);
+    }
+    expect(pages[3]).not.toContain("OTHER OPEN ACTIONS");
+    expect(pages[3]).not.toContain("WAITING / FOLLOW-UP");
+  });
+  it("separates lower-priority sections when they cannot fit together", () => {
+    const data = allSectionsFixture(); data.tasks = data.tasks.slice(3);
+    data.tasks.forEach(task => { task.description = "Long action ".repeat(180); });
+    const pages = renderDigest(data);
+    expect(pages).toHaveLength(3);
+    expect(pages[1]).toContain("OTHER OPEN ACTIONS"); expect(pages[1]).not.toContain("WAITING / FOLLOW-UP");
+    expect(pages[2]).toContain("WAITING / FOLLOW-UP"); expect(pages[2]).not.toContain("OTHER OPEN ACTIONS");
+  });
+  it("starts the next urgency section after all continuation pages of a large section", () => {
+    const data = allSectionsFixture();
+    data.tasks[0].description = "<overdue & action> 😀".repeat(500);
+    const pages = renderDigest(data);
+    const urgent = pages.findIndex(page => page.includes("<b>URGENT / DUE TODAY ·"));
+    expect(urgent).toBeGreaterThan(2);
+    for (const page of pages.slice(1, urgent)) {
+      expect(page).toContain("<b>OVERDUE · 1</b> — PART ");
+      expect(page).not.toContain("URGENT / DUE TODAY");
+      expect(page).not.toContain("DUE WITHIN");
+    }
+    expect(pages[urgent + 1]).toContain("<b>DUE WITHIN 7 DAYS · 1</b>");
+    expect(pages.join("\n").match(/&lt;overdue &amp; action&gt; 😀/g)).toHaveLength(500);
+  });
+  it.each(["other", "waiting", "both"])("keeps oversized %s sections on their own continuation pages", (large) => {
+    const data = allSectionsFixture(); data.tasks = data.tasks.slice(3);
+    if (large !== "waiting") data.tasks[0].description = "<long other & action> 😀".repeat(400);
+    if (large !== "other") data.tasks[1].description = "<long waiting & action> 😀".repeat(400);
+    const pages = renderDigest(data);
+    for (const page of pages.slice(1)) {
+      expect([...page.matchAll(/^[🔴🟠🟡⚪💤]+ <b>/gmu)]).toHaveLength(1);
+      if (page.includes(large === "waiting" ? "WAITING / FOLLOW-UP" : "OTHER OPEN ACTIONS")) expect(page).toContain("— PART ");
+    }
+    const row = { id: crypto.randomUUID(), digest_date: "2026-11-01", view: "outlook", page: 0 };
+    for (let page = 0; page < pages.length - 1; page++) {
+      expect(digestMessage({ ...row, page }, pages, "⏳ Pending Outlook confirmation: /done · 0/2 confirmed").payload.text.length).toBeLessThanOrEqual(3400);
+    }
+  });
+  it("retains completed rows and section boundaries when rendering an existing digest", () => {
+    const data = allSectionsFixture(); const groups = digestGroups(renderDigest(data));
+    data.tasks[0].status = "done"; data.tasks[1].status = "dismissed"; data.tasks[3].status = "waiting";
+    const notes = new Map([[3, " <i>· ⏳ Done pending</i>"], [4, " <i>· 💤 Waiting</i>"]]);
+    const pages = renderDigest(data, new Date(), groups, notes);
+    expect(pages).toHaveLength(5);
+    expect(pages[1]).toContain("OVERDUE · 0 remaining / 1"); expect(pages[1]).toContain("☑ <code>#1</code>");
+    expect(pages[2]).toContain("URGENT / DUE TODAY · 0 remaining / 1"); expect(pages[2]).toContain("☒ <code>#2</code>");
+    expect(pages[3]).toContain("Done pending</i>");
+    expect(pages[4]).toContain("OTHER OPEN ACTIONS · 1"); expect(pages[4]).toContain("💤 Waiting</i>");
+  });
+  it("omits empty sections without filling another urgency page with lower-priority tasks", () => {
+    const data = allSectionsFixture(); data.tasks = data.tasks.filter(task => [3, 5].includes(task.id));
+    const pages = renderDigest(data);
+    expect(pages).toHaveLength(3);
+    expect(pages[1]).toContain("DUE WITHIN 7 DAYS"); expect(pages[1]).not.toContain("WAITING / FOLLOW-UP");
+    expect(pages[2]).toContain("WAITING / FOLLOW-UP");
+    data.tasks = [];
+    expect(renderDigest(data)[1]).toBe("No active tasks.");
+  });
   it("hides Outlook navigation at the edges and keeps every rendered view within budget", () => {
     const data = fixture(); data.tasks[0].description = "<>&😀".repeat(3000);
     data.tasks[0].sender_name = "<sender&>".repeat(1000);
