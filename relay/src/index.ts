@@ -1,4 +1,5 @@
 import { cloudFetch, runCloudScheduled, type BridgeSnapshot } from "./cloud";
+import { telegramRequest } from "./telegram-api";
 
 export interface Env {
   DB: D1Database;
@@ -197,14 +198,7 @@ function provenance(envelope: BundleEnvelope): string {
 }
 
 export async function telegramSend(env: Env, text: string): Promise<void> {
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    signal: AbortSignal.timeout(10000),
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
-  });
-  const result = await response.json().catch(() => null) as { ok?: boolean } | null;
-  if (!response.ok || !result?.ok) throw new Error(`Telegram delivery failed (HTTP ${response.status})`);
+  await telegramRequest(env, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true });
 }
 
 async function ensureDelivery(env: Env, deliveryDate: string, nowText: string): Promise<DeliveryRow> {

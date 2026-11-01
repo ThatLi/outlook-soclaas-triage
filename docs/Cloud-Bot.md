@@ -37,6 +37,27 @@ mailbox snapshot and current cloud task states. Sync timestamps and classificati
 warnings remain visible. Category totals describe the 24-hour window at snapshot
 preparation, even if Windows has been off for days.
 
+Each scheduled digest and `/list` digest is one interactive message. Use
+**Overview**, **Outlook**, and **News** to switch views. Outlook pages show real
+task IDs and only show Previous/Next when another page exists. News currently
+shows “not implemented yet”. Keep using typed `/waiting`, `/reopen`, `/done`,
+and `/dismiss` commands: all digests from the current Singapore date update
+automatically, preserving the selected view. `/done` and `/dismiss` update only
+after each successful Outlook acknowledgement. Earlier editions keep their last
+saved content and remain navigable. `/list` synchronization refreshes its existing
+digest; command queue/completion acknowledgements are still separate messages.
+Failed edits retry on later bot, bridge or scheduled runs. Telegram rate limits
+can delay updates. Deleted or inaccessible digest messages are retired without
+blocking other deliveries.
+
+For the interactive-digest upgrade, apply migration `0003_interactive_digests.sql`
+with `npx wrangler d1 migrations apply outlook-triage-relay --remote` before
+deploying the Worker. Run `outlook-triage cloud-webhook-enable` with the updated
+Python installation to preserve message updates and enable `callback_query`
+updates without discarding pending updates. Existing queued chunk deliveries
+retain their progress. The old sample navigation-trial buttons are retired.
+The migration is additive; retain the new tables when rolling back the Worker.
+
 ## Cutover
 
 The current deployment uses **https://noelle-outlook-triage-bot.pages.dev** for

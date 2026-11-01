@@ -2,6 +2,8 @@ import {
   decryptEnvelope, escapeHtml, singaporeClock, telegramSend, validateEnvelope,
   type BundlePayload, type Env,
 } from "./index";
+import { deliverDigest, digestCallback, dirtyDigests, queueDigest, refreshDigests, type DigestCallback, type DigestRow } from "./interactive-digest";
+import { TelegramFailure } from "./telegram-api";
 
 type Status = "open" | "waiting" | "done" | "dismissed";
 export interface CloudTask {
@@ -18,7 +20,7 @@ export interface BridgeSnapshot {
 }
 interface Event {
   id: number; action: string; task_ids: string; completed_ids: string; retry_limit: number;
-  status: string; created_at: string;
+  status: string; created_at: string; digest_id: string | null;
 }
 interface Command { action: string; ids: number[]; option?: string; limit: number }
 const statuses = ["open", "waiting", "done", "dismissed"];
@@ -94,7 +96,7 @@ async function encryptionKey(env: Env): Promise<CryptoKey> {
   const bytes = unb64(env.RELAY_ENCRYPTION_KEY.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - env.RELAY_ENCRYPTION_KEY.length % 4) % 4));
   return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
-async function seal(env: Env, id: string, chunks: string[]): Promise<string> {
+export async function seal(env: Env, id: string, chunks: string[]): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ciphertext = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv, additionalData: new TextEncoder().encode(id) },
@@ -102,7 +104,7 @@ async function seal(env: Env, id: string, chunks: string[]): Promise<string> {
   );
   return JSON.stringify({ iv: b64(iv), ciphertext: b64(new Uint8Array(ciphertext)) });
 }
-async function unseal(env: Env, id: string, value: string): Promise<string[]> {
+export async function unseal(env: Env, id: string, value: string): Promise<string[]> {
   const data = JSON.parse(value);
   const plain = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: unb64(data.iv), additionalData: new TextEncoder().encode(id) },
@@ -138,7 +140,7 @@ async function withLock(env: Env, work: () => Promise<Response>): Promise<Respon
   finally { await env.DB.prepare("UPDATE cloud_lock SET expires_ms=0 WHERE owner=?").bind(owner).run(); }
 }
 
-async function snapshot(env: Env): Promise<BridgeSnapshot | null> {
+export async function snapshot(env: Env): Promise<BridgeSnapshot | null> {
   const row = await env.DB.prepare("SELECT * FROM cloud_snapshot WHERE singleton=1").first();
   if (!row) return null;
   const payload = await decryptEnvelope(JSON.parse(String(row.envelope_json)), env.RELAY_ENCRYPTION_KEY);
@@ -148,7 +150,7 @@ async function snapshot(env: Env): Promise<BridgeSnapshot | null> {
   return { ...data, tasks: data.tasks.map(t => ({ ...t, status: lookup.get(t.id) ?? t.status })) };
 }
 
-function packDigestBlocks(blocks: string[], limit = 3400): string[] {
+function packDigestBlocks(blocks: string[], limit = 3200): string[] {
   const messages: string[] = [];
   let current = "";
   for (const block of blocks) {
@@ -186,7 +188,7 @@ function digestSection(heading: string, emoji: string, tasks: CloudTask[], today
   const title = `${emoji} <b>${escapeHtml(heading.toUpperCase())} · ${tasks.length}</b>`;
   // Split only at complete rendered fragments. Each fragment has balanced HTML,
   // including repeated task IDs when a long description needs continuation.
-  const groups = packDigestBlocks(tasks.flatMap(task => digestTaskParts(task, today)), 3400 - title.length - 60);
+  const groups = packDigestBlocks(tasks.flatMap(task => digestTaskParts(task, today)), 3200 - title.length - 60);
   return groups.map((group, index) => `${title}${groups.length > 1 ? ` — PART ${index + 1} OF ${groups.length}` : ""}\n\n${group}`);
 }
 
@@ -232,19 +234,35 @@ export function renderDigest(data: BridgeSnapshot, now = new Date()): string[] {
       compact = [];
     } else compact.push(...parts);
   }
-  return [...messages, ...packDigestBlocks(compact)];
+  const pages = [...messages, ...packDigestBlocks(compact)];
+  return pages.length === 1 ? [...pages, "No active tasks."] : pages;
 }
 
-async function flush(env: Env): Promise<void> {
+async function flush(env: Env, now = new Date()): Promise<void> {
+  const pause = await env.DB.prepare("SELECT telegram_retry_at FROM cloud_lock WHERE singleton=1").first<{ telegram_retry_at: number }>();
+  if (pause && pause.telegram_retry_at > Date.now()) return;
+  await refreshDigests(env, now);
+  const afterRefresh = await env.DB.prepare("SELECT telegram_retry_at FROM cloud_lock WHERE singleton=1").first<{ telegram_retry_at: number }>();
+  if (afterRefresh && afterRefresh.telegram_retry_at > Date.now()) return;
   const rows = await env.DB.prepare("SELECT * FROM cloud_outbox WHERE delivered_at IS NULL ORDER BY created_at,id LIMIT 2").all<{
-    id: string; sealed_chunks: string; next_chunk: number;
+    id: string; sealed_chunks: string; next_chunk: number; digest_id: string | null;
   }>();
   let budget = 3;
   for (const row of rows.results) {
+    if (row.digest_id) {
+      const digest = await env.DB.prepare("SELECT * FROM interactive_digests WHERE id=?").bind(row.digest_id).first<DigestRow>();
+      if (!digest || !await deliverDigest(env, digest, now)) return;
+      await env.DB.prepare("UPDATE cloud_outbox SET delivered_at=? WHERE id=?").bind(now.toISOString(), row.id).run();
+      continue;
+    }
     const chunks = await unseal(env, row.id, row.sealed_chunks);
     for (let i = row.next_chunk; i < chunks.length; i++) {
       if (--budget < 0) return;
-      try { await telegramSend(env, chunks[i]); } catch { return; }
+      try { await telegramSend(env, chunks[i]); } catch (error) {
+        if (error instanceof TelegramFailure && error.retryAfter) await env.DB.prepare("UPDATE cloud_lock SET telegram_retry_at=? WHERE singleton=1")
+          .bind(Date.now() + error.retryAfter * 1000).run();
+        return;
+      }
       await env.DB.prepare("UPDATE cloud_outbox SET next_chunk=?,delivered_at=? WHERE id=?")
         .bind(i + 1, i + 1 === chunks.length ? new Date().toISOString() : null, row.id).run();
     }
@@ -255,7 +273,8 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   if (!env.TELEGRAM_WEBHOOK_SECRET || request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.TELEGRAM_WEBHOOK_SECRET) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  const update = await request.json() as { update_id?: number; message?: { chat?: { id?: number; type?: string }; from?: { is_bot?: boolean }; text?: string } };
+  const update = await request.json() as { update_id?: number; callback_query?: DigestCallback; message?: { chat?: { id?: number; type?: string }; from?: { is_bot?: boolean }; text?: string } };
+  if (Number.isSafeInteger(update.update_id) && update.callback_query) return withLock(env, () => digestCallback(update.callback_query!, env));
   const message = update.message;
   if (!Number.isSafeInteger(update.update_id) || !message || message.chat?.type !== "private"
     || String(message.chat?.id) !== env.TELEGRAM_CHAT_ID || message.from?.is_bot || typeof message.text !== "string") return Response.json({ ok: true });
@@ -293,7 +312,6 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     } else {
       pending = mailboxActions.includes(cmd.action);
       chunks = [`⏳ /${cmd.action} queued. It will complete when the Windows Outlook bridge connects.`];
-      if (cmd.action === "list") chunks.push(...renderDigest(data));
     }
     const event = env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,task_ids,retry_limit,status,created_at) VALUES(?,?,?,?,?,?)")
       .bind(key, cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
@@ -301,6 +319,11 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     if (cmd && data && !missing.length && ["waiting", "reopen"].includes(cmd.action)) {
       for (const id of ids) statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=(SELECT id FROM cloud_events WHERE dedupe_key=?) WHERE id=?")
         .bind(cmd.action === "waiting" ? "waiting" : "open", key, id));
+      statements.push(dirtyDigests(env));
+    }
+    if (cmd?.action === "list") {
+      const digest = await queueDigest(env);
+      statements.push(...digest.statements, env.DB.prepare("UPDATE cloud_events SET digest_id=? WHERE dedupe_key=?").bind(digest.id, key));
     }
     statements.push(await outbox(env, chunks));
     await env.DB.batch(statements);
@@ -321,8 +344,10 @@ async function acceptSnapshot(request: Request, env: Env): Promise<Response> {
       ON CONFLICT(singleton) DO UPDATE SET envelope_json=excluded.envelope_json,generated_ms=excluded.generated_ms,last_seen=excluded.last_seen`)
       .bind(data.dataset_id, JSON.stringify(envelope), Date.parse(envelope.generated_at), new Date().toISOString())];
     for (const task of data.tasks) statements.push(env.DB.prepare("INSERT OR IGNORE INTO cloud_tasks(id,status) VALUES(?,?)").bind(task.id, task.status));
+    statements.push(dirtyDigests(env));
     // Batch in one transaction: a task import and its encrypted details stay consistent.
     await env.DB.batch(statements);
+    await flush(env);
     return Response.json({ status: "stored", bundle_id: envelope.bundle_id });
   });
 }
@@ -357,6 +382,7 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
       if (!completed.includes(body.task_id)) completed.push(body.task_id);
       if (event.action !== "read") statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=? WHERE id=? AND revision<=?")
         .bind(event.action === "done" ? "done" : "dismissed", event.id, body.task_id, event.id));
+      if (event.action !== "read") statements.push(dirtyDigests(env));
       statements.push(env.DB.prepare("UPDATE cloud_events SET completed_ids=? WHERE id=?").bind(JSON.stringify(completed), event.id));
     }
     const finished = body.failed || (ids.length ? completed.length === ids.length : body.task_id === undefined);
@@ -371,10 +397,8 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
         message += `\n${["processed", "skipped", "failed", "unchanged"].map(k => `${k}=${Number.isSafeInteger(counts[k]) ? counts[k] : 0}`).join(" ")}`;
       }
       const chunks = textChunks(message);
-      if (!body.failed && event.action === "list") {
-        const data = await snapshot(env);
-        if (data) chunks.push(...renderDigest(data));
-      }
+      if (event.action === "list" && event.digest_id) statements.push(env.DB.prepare("UPDATE interactive_digests SET dirty=1 WHERE id=? AND digest_date=? AND disabled=0")
+        .bind(event.digest_id, singaporeClock(new Date()).date));
       statements.push(await outbox(env, chunks));
     }
     if (statements.length) await env.DB.batch(statements);
@@ -407,14 +431,13 @@ export async function runCloudScheduled(env: Env, now = new Date()): Promise<voi
     const clock = singaporeClock(now);
     const key = `digest:${clock.date}`;
     if (clock.hour >= 8 && !await env.DB.prepare("SELECT id FROM cloud_events WHERE dedupe_key=?").bind(key).first()) {
-      const data = await snapshot(env);
-      const chunks = data ? renderDigest(data, now) : ["No bridge snapshot yet. The daily digest will become available after Windows publishes one."];
+      const digest = await queueDigest(env, now);
       await env.DB.batch([
         env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,status,created_at) VALUES(?,'digest','done',?)").bind(key, now.toISOString()),
-        await outbox(env, chunks),
+        ...digest.statements,
       ]);
     }
-    await flush(env);
+    await flush(env, now);
     // Keep update deduplication tombstones, but discard old encrypted delivered responses.
     await env.DB.prepare("DELETE FROM cloud_outbox WHERE delivered_at IS NOT NULL AND delivered_at<?")
       .bind(new Date(now.getTime() - 30 * 86400000).toISOString()).run();
