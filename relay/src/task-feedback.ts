@@ -3,7 +3,7 @@ import { escapeHtml, singaporeClock } from "./index";
 import { TelegramFailure, telegramRequest } from "./telegram-api";
 
 export interface TaskState { id: number; status: string; revision: number }
-export interface TaskEvent { id: number; action: string; status: string; task_ids: string; completed_ids: string }
+export interface TaskEvent { id: number; action: string; status: string; task_ids: string; completed_ids: string; digest_id?: string | null }
 export interface DigestGroup { heading: string; ids: number[] }
 
 // Match only renderer-owned HTML; email text has already been escaped.
@@ -80,6 +80,16 @@ export async function flushFeedback(env: Env) {
     .bind(singaporeClock(new Date()).date).all<{ task_ids_json: string; message_id: number | null; dirty: number }>();
   for (const row of rows.results) {
     const event = (await env.DB.prepare("SELECT * FROM cloud_events WHERE id=?").bind(row.event_id).first<TaskEvent>())!;
+    if (event.action === "list") {
+      if (event.status === "pending") continue;
+      const digest = event.digest_id ? await env.DB.prepare("SELECT message_id,dirty,disabled FROM interactive_digests WHERE id=?")
+        .bind(event.digest_id).first<{ message_id: number | null; dirty: number; disabled: number }>() : null;
+      if (event.status === "failed" || !digest || digest.disabled) {
+        await env.DB.prepare("UPDATE cloud_task_feedback SET delivered_at=? WHERE id=?").bind(new Date().toISOString(), row.id).run();
+        continue;
+      }
+      if (digest.message_id === null || digest.dirty) continue;
+    }
     const ids: number[] = JSON.parse(event.task_ids);
     const relevant = digests.results.filter(digest => JSON.parse(digest.task_ids_json).some((id: number) => ids.includes(id)));
     // Do not delete a command before all of today's targeted digests are current.

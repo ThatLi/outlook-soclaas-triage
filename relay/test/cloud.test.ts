@@ -16,6 +16,7 @@ class SQLiteD1 {
     this.db.exec(readFileSync(new URL("../migrations/0003_interactive_digests.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0004_digest_payload_hash.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0005_quiet_task_feedback.sql", import.meta.url), "utf8"));
+    this.db.exec(readFileSync(new URL("../migrations/0006_list_reply_cleanup.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) {
     let args: (string | number | null)[] = [];
@@ -127,6 +128,84 @@ beforeEach(async () => {
   expect((await publish()).status).toBe(200);
 });
 afterEach(() => { database.db.close(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe("temporary /list acknowledgement messages", () => {
+  function replies(event: number) {
+    return database.db.prepare("SELECT command_message_id,delivered_at FROM cloud_task_feedback WHERE event_id=? ORDER BY id").all(event);
+  }
+  it("deletes pending and completed bot replies only after a successful digest refresh", async () => {
+    await command("/list", 900);
+    const job = (await poll()).job!;
+    const queued = Number(replies(job.id)[0].command_message_id);
+    const digest = digestRows()[0];
+    expect(telegramCalls.filter(call => call.method === "deleteMessage")).toHaveLength(0);
+    expect(replies(job.id)[0].delivered_at).toBeNull();
+    await ack({ event_id: job.id });
+    const notices = replies(job.id);
+    expect(notices).toHaveLength(2);
+    expect(notices.every(row => row.delivered_at !== null)).toBe(true);
+    expect(telegramCalls.filter(call => call.method === "deleteMessage").map(call => call.body.message_id))
+      .toEqual([queued, Number(notices[1].command_message_id)]);
+    expect(telegramCalls.filter(call => call.method === "deleteMessage").every(call => ![900, digest.message_id].includes(call.body.message_id))).toBe(true);
+    const count = telegramCalls.length;
+    await ack({ event_id: job.id }); await command("/list", 900);
+    expect(telegramCalls).toHaveLength(count);
+    expect(digestRows()).toHaveLength(1);
+  });
+  it("keeps acknowledgement messages until a required digest edit succeeds", async () => {
+    await command("/list"); const job = (await poll()).job!;
+    await database.prepare("UPDATE interactive_digests SET last_payload_sha256=NULL").run();
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("editMessageText")
+      ? Response.json({ ok: false }, { status: 503 }) : normal(url, init)));
+    await ack({ event_id: job.id });
+    expect(digestRows()[0].dirty).toBe(1);
+    expect(telegramCalls.filter(call => call.method === "deleteMessage")).toHaveLength(0);
+    expect(replies(job.id)).toHaveLength(2);
+    vi.setSystemTime(new Date(Date.now() + 6000)); vi.stubGlobal("fetch", telegramMock());
+    await poll();
+    expect(digestRows()[0].dirty).toBe(0);
+    expect(telegramCalls.filter(call => call.method === "deleteMessage")).toHaveLength(2);
+  });
+  it("retries rate-limited cleanup without resending replies or repeating synchronization", async () => {
+    await command("/list"); const job = (await poll()).job!;
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("deleteMessage")
+      ? Response.json({ ok: false, parameters: { retry_after: 30 } }, { status: 429 }) : normal(url, init)));
+    await ack({ event_id: job.id });
+    const fetcher = telegramMock(); vi.stubGlobal("fetch", fetcher);
+    await poll(); expect(fetcher).not.toHaveBeenCalled();
+    vi.setSystemTime(new Date(Date.now() + 31000)); await poll();
+    expect(telegramCalls.filter(call => call.method === "deleteMessage")).toHaveLength(2);
+    expect(sent.filter(text => text.includes("/list queued"))).toHaveLength(1);
+    expect(sent.filter(text => text.includes("/list completed"))).toHaveLength(1);
+    expect(database.db.prepare("SELECT count(*) AS n FROM cloud_events WHERE action='list'").get()?.n).toBe(1);
+    expect((await poll()).job).toBeNull();
+  });
+  it("leaves failure messages visible", async () => {
+    await command("/list"); const job = (await poll()).job!;
+    await ack({ event_id: job.id, failed: true });
+    expect(sent.at(-1)).toContain("/list failed on the bridge");
+    expect(telegramCalls.filter(call => call.method === "deleteMessage")).toHaveLength(0);
+    expect(database.db.prepare("SELECT id FROM cloud_task_feedback WHERE delivered_at IS NULL").get()).toBeUndefined();
+  });
+  it("skips expired pending-notice cleanup while deleting the new completion notice", async () => {
+    await command("/list"); const job = (await poll()).job!;
+    const queued = Number(replies(job.id)[0].command_message_id);
+    vi.setSystemTime(new Date(Date.now() + 49 * 3600000));
+    await ack({ event_id: job.id });
+    const deleted = telegramCalls.filter(call => call.method === "deleteMessage").map(call => call.body.message_id);
+    expect(deleted).not.toContain(queued);
+    expect(deleted).toEqual([Number(replies(job.id)[1].command_message_id)]);
+  });
+  it("keeps /sync and /retry replies unchanged", async () => {
+    for (const text of ["/sync", "/retry"]) {
+      await command(text); await ack({ event_id: (await poll()).job!.id });
+    }
+    expect(sent).toHaveLength(4);
+    expect(telegramCalls.filter(call => call.method === "deleteMessage")).toHaveLength(0);
+  });
+});
 
 describe("PR #13 quiet task feedback with interactive pages", () => {
   async function trackedDigest() {

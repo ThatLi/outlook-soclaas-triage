@@ -3,7 +3,7 @@ import {
   type BundlePayload, type Env,
 } from "./index";
 import { deliverDigest, digestCallback, dirtyDigests, ensureDigestLayouts, queueDigest, refreshDigests, type DigestCallback, type DigestRow } from "./interactive-digest";
-import { TelegramFailure } from "./telegram-api";
+import { TelegramFailure, telegramRequest } from "./telegram-api";
 import { flushFeedback, taskFeedback, type DigestGroup } from "./task-feedback";
 
 type Status = "open" | "waiting" | "done" | "dismissed";
@@ -126,10 +126,11 @@ export function textChunks(text: string, limit = 3400): string[] {
   if (chunk) chunks.push(chunk);
   return chunks;
 }
-async function outbox(env: Env, chunks: string[]): Promise<D1PreparedStatement> {
+async function outbox(env: Env, chunks: string[], listEvent?: number | string): Promise<D1PreparedStatement> {
   const id = crypto.randomUUID();
-  return env.DB.prepare("INSERT INTO cloud_outbox(id,sealed_chunks,created_at) VALUES(?,?,?)")
-    .bind(id, await seal(env, id, chunks), new Date().toISOString());
+  const column = typeof listEvent === "string" ? "dedupe_key" : "id";
+  return env.DB.prepare(`INSERT INTO cloud_outbox(id,sealed_chunks,created_at,list_event_id) VALUES(?,?,?,(SELECT id FROM cloud_events WHERE ${column}=?))`)
+    .bind(id, await seal(env, id, chunks), new Date().toISOString(), listEvent ?? null);
 }
 
 async function withLock(env: Env, work: () => Promise<Response>): Promise<Response> {
@@ -256,9 +257,10 @@ async function flush(env: Env, now = new Date()): Promise<void> {
   const afterRefresh = await env.DB.prepare("SELECT telegram_retry_at FROM cloud_lock WHERE singleton=1").first<{ telegram_retry_at: number }>();
   if (afterRefresh && afterRefresh.telegram_retry_at > Date.now()) return;
   const rows = await env.DB.prepare("SELECT * FROM cloud_outbox WHERE delivered_at IS NULL ORDER BY created_at,id LIMIT 2").all<{
-    id: string; sealed_chunks: string; next_chunk: number; digest_id: string | null;
+    id: string; sealed_chunks: string; next_chunk: number; digest_id: string | null; list_event_id: number | null;
   }>();
   let budget = 3;
+  let listRepliesSent = false;
   for (const row of rows.results) {
     if (row.digest_id) {
       const digest = await env.DB.prepare("SELECT * FROM interactive_digests WHERE id=?").bind(row.digest_id).first<DigestRow>();
@@ -269,15 +271,25 @@ async function flush(env: Env, now = new Date()): Promise<void> {
     const chunks = await unseal(env, row.id, row.sealed_chunks);
     for (let i = row.next_chunk; i < chunks.length; i++) {
       if (--budget < 0) return;
-      try { await telegramSend(env, chunks[i]); } catch (error) {
+      const statements = [env.DB.prepare("UPDATE cloud_outbox SET next_chunk=?,delivered_at=? WHERE id=?")
+        .bind(i + 1, i + 1 === chunks.length ? new Date().toISOString() : null, row.id)];
+      try {
+        if (row.list_event_id !== null) {
+          const result = await telegramRequest(env, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text: chunks[i], parse_mode: "HTML", disable_web_page_preview: true });
+          if (!Number.isSafeInteger(result.message_id) || result.message_id! <= 0) throw new Error("Telegram did not return a reply message ID");
+          statements.push(env.DB.prepare("INSERT INTO cloud_task_feedback(event_id,command_message_id,expires_at,allow_fallback,created_at) VALUES(?,?,?,0,?)")
+            .bind(row.list_event_id, result.message_id!, Date.now() + 48 * 3600000 - 60000, new Date().toISOString()));
+          listRepliesSent = true;
+        } else await telegramSend(env, chunks[i]);
+      } catch (error) {
         if (error instanceof TelegramFailure && error.retryAfter) await env.DB.prepare("UPDATE cloud_lock SET telegram_retry_at=? WHERE singleton=1")
           .bind(Date.now() + error.retryAfter * 1000).run();
         return;
       }
-      await env.DB.prepare("UPDATE cloud_outbox SET next_chunk=?,delivered_at=? WHERE id=?")
-        .bind(i + 1, i + 1 === chunks.length ? new Date().toISOString() : null, row.id).run();
+      await env.DB.batch(statements);
     }
   }
+  if (listRepliesSent) await flushFeedback(env);
 }
 
 async function webhook(request: Request, env: Env): Promise<Response> {
@@ -339,7 +351,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       statements.push(...digest.statements, env.DB.prepare("UPDATE cloud_events SET digest_id=? WHERE dedupe_key=?").bind(digest.id, key));
     }
     if (quiet) statements.push(...await taskFeedback(env, key, ids, { message: message.message_id, date: message.date }));
-    else statements.push(await outbox(env, chunks));
+    else statements.push(await outbox(env, chunks, cmd?.action === "list" && pending ? key : undefined));
     await env.DB.batch(statements);
     await flush(env);
     return Response.json({ ok: true });
@@ -413,7 +425,8 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
       const chunks = textChunks(message);
       if (event.action === "list" && event.digest_id) statements.push(env.DB.prepare("UPDATE interactive_digests SET dirty=1 WHERE id=? AND digest_date=? AND disabled=0")
         .bind(event.digest_id, singaporeClock(new Date()).date));
-      if (body.failed || !["read", "done", "dismiss"].includes(event.action)) statements.push(await outbox(env, chunks));
+      if (body.failed || !["read", "done", "dismiss"].includes(event.action)) statements.push(await outbox(env, chunks,
+        event.action === "list" && !body.failed ? event.id : undefined));
     }
     if (["read", "done", "dismiss"].includes(event.action)) statements.push(...await taskFeedback(env, event.id, ids, undefined, !body.failed));
     if (statements.length) await env.DB.batch(statements);

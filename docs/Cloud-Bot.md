@@ -45,7 +45,9 @@ and `/dismiss` commands: all digests from the current Singapore date update
 automatically, preserving the selected view. `/done` and `/dismiss` update only
 after each successful Outlook acknowledgement. Earlier editions keep their last
 saved content and remain navigable. `/list` synchronization refreshes its existing
-digest; command queue/completion acknowledgements are still separate messages.
+digest. Its pending and completion notices are temporary: both are deleted after
+synchronization succeeds and the digest is current. Failed runs keep their
+actionable replies. The interactive digest and the user's `/list` command remain.
 Failed edits retry on later bot, bridge or scheduled runs. Telegram rate limits
 can delay updates. Deleted or inaccessible digest messages are retired without
 blocking other deliveries.
@@ -58,7 +60,8 @@ still refresh so navigating to another section shows current content.
 interactive digests. Accepted task commands are deleted only after feedback is
 delivered. Invalid commands remain visible. Successful task commands do not send
 separate queued/completed replies when an editable digest covers the tasks.
-Other commands keep their existing replies, and failures remain actionable.
+`/list` bot acknowledgements are also cleaned up after a successful refresh;
+`/sync` and `/retry` keep their existing replies. Failures remain actionable.
 
 | Task state | Appearance |
 | --- | --- |
@@ -97,6 +100,10 @@ deploying. The original `0003_digest_interactions.sql` migration from PR #13 is
 retained for installations that already applied it. Existing interactive messages
 acquire their retained layout on first refresh; rows removed before this upgrade
 cannot have their original membership reconstructed. No bridge change is needed.
+For temporary `/list` acknowledgement cleanup, apply `0006_list_reply_cleanup.sql`
+before deployment. Only newly sent tracked notices can be deleted automatically;
+previously untracked notice IDs cannot be recovered. Telegram's deletion age
+limit and best-effort cleanup rules also apply to these notices.
 
 ## Cutover
 
