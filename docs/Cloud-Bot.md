@@ -43,8 +43,8 @@ task IDs and only show Previous/Next when another page exists. Overdue,
 urgent/due-today, and upcoming-deadline sections
 each start on separate Outlook pages. Other open actions and waiting/follow-up
 share a page when they fit, retaining separate headings. Oversized sections have
-their own continuation pages; empty sections are omitted. News currently
-shows “not implemented yet”. Keep using typed `/waiting`, `/reopen`, `/done`,
+their own continuation pages; empty sections are omitted. The optional News trial
+shows a saved daily selection from Hacker News (see below). Keep using typed `/waiting`, `/reopen`, `/done`,
 and `/dismiss` commands: all digests from the current Singapore date update
 automatically, preserving the selected view. `/done` and `/dismiss` update only
 after each successful Outlook acknowledgement. Earlier editions keep their last
@@ -108,6 +108,64 @@ For temporary `/list` acknowledgement cleanup, apply `0006_list_reply_cleanup.sq
 before deployment. Only newly sent tracked notices can be deleted automatically;
 previously untracked notice IDs cannot be recovered. Telegram's deletion age
 limit and best-effort cleanup rules also apply to these notices.
+
+## Daily news trial
+
+The trial fills the existing **News** tab in the 08:00 Asia/Singapore daily brief.
+It selects up to five stories posted within the previous 24 hours, preserving
+Hacker News ranking among the first ten candidates. This is a technology-focused
+trial, not a general or Singapore news service. Headlines link to HN discussions;
+they are community submissions, not fact-checked summaries. No article bodies,
+mailbox content, or credentials are sent to the news source.
+
+The first digest created on each Singapore date fetches the selection; `/list`
+and that day's scheduled brief reuse it. Thus `/list` before 08:00 can set the
+morning selection. Saved news is encrypted with the existing relay key and kept
+with its digest for the existing 30-day retention period. Older editions retain
+their selection when navigated or when task feedback changes.
+
+This approach uses the [official HN JSON API](https://github.com/HackerNews/API),
+the existing Cron, D1 storage, Telegram delivery retries, and private-chat access
+checks. It needs no new package, API key, Windows uptime, or cloud SoCLaaS access.
+There are at most eleven news requests per date, with four-second request
+deadlines and 64 KiB response limits. This keeps the trial small within
+[Workers Free limits](https://developers.cloudflare.com/workers/platform/limits/);
+production CPU usage still needs to be measured. A Windows-based news collector
+would miss editions while Windows is off; web search or AI summaries would add
+credentials, cost, and additional failure modes.
+
+Enable after reviewing this branch:
+
+```powershell
+cd relay
+npm run typecheck
+npm test
+npx wrangler d1 migrations apply outlook-triage-relay --remote
+npx wrangler deploy
+```
+
+Apply `0007_news_trial.sql` before deployment. `NEWS_TRIAL_ENABLED` is `"true"`
+in this branch's `relay/wrangler.jsonc`; set it to `"false"` and redeploy to stop
+collecting news for new editions. Previously saved editions remain accessible.
+Keep the additive column when rolling back the Worker.
+
+Source outages never block Outlook delivery. A partial response keeps eligible
+stories and shows a warning; a total failure saves an unavailable notice for that
+date. News fetches retry on the next date, while Telegram delivery continues using
+the existing retry path. Empty selections explicitly say no eligible stories were
+found. The trial does not add cross-day duplicate suppression or multiple sources.
+
+Review improvements applied after the first implementation: bounded streamed
+responses, escaped and decoded headlines, fixed-host discussion links, per-item
+failure isolation, and bounded output. Automated coverage includes daily reuse,
+date rollover, frozen history, operation without a bridge snapshot, source failure,
+source rank, invalid/deleted/stale entries, and hostile or oversized input.
+
+Before judging the trial successful, observe at least two morning deliveries with
+Windows off, use News/Outlook navigation and `/list`, and check Worker CPU and
+errors. Evaluate relevance, empty editions, and source reliability before adding
+other publishers or AI summaries. Automated tests do not establish production
+free-tier CPU headroom or live Telegram delivery.
 
 ## Cutover
 

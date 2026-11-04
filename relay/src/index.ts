@@ -8,6 +8,7 @@ export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_CHAT_ID: string;
   CLOUD_BOT_ENABLED?: string;
+  NEWS_TRIAL_ENABLED?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
 }
 
