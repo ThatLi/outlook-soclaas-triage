@@ -18,6 +18,7 @@ class SQLiteD1 {
     this.db.exec(readFileSync(new URL("../migrations/0004_digest_payload_hash.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0005_quiet_task_feedback.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0006_list_reply_cleanup.sql", import.meta.url), "utf8"));
+    this.db.exec(readFileSync(new URL("../migrations/0007_news_trial.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) {
     let args: (string | number | null)[] = [];
@@ -448,11 +449,11 @@ describe("interactive digests", () => {
     expect(telegramCalls.filter(c => c.method === "editMessageText")).toHaveLength(0);
     expect(digestRows()[0].dirty).toBe(0);
   });
-  it("uses the exact news placeholder and acknowledges repeated navigation taps", async () => {
+  it("explains missing news and acknowledges repeated navigation taps", async () => {
     await command("/list");
     const row = digestRows()[0];
     await callback(row, "news");
-    expect(telegramCalls.at(-1)?.body.text).toContain("<b>News</b>\n\nnot implemented yet");
+    expect(telegramCalls.at(-1)?.body.text).toContain("News trial is disabled or no selection was saved");
     const count = sent.length;
     vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("editMessageText")
       ? Response.json({ ok: false, description: "Bad Request: message is not modified" }, { status: 400 })
@@ -460,6 +461,50 @@ describe("interactive digests", () => {
     expect((await callback(row, "news")).status).toBe(200);
     expect(digestRows()[0].dirty).toBe(0);
     expect(sent).toHaveLength(count);
+  });
+  it("shares frozen daily news with list digests and preserves it through refresh and next-day navigation", async () => {
+    env.NEWS_TRIAL_ENABLED = "true";
+    let requests = 0;
+    const telegram = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      if (!url.startsWith("https://hacker-news.firebaseio.com/")) return telegram(url, init);
+      requests++;
+      return Response.json(url.endsWith("topstories.json") ? [42] : {
+        id: 42, type: "story", title: "Trial headline <safe>", time: Date.now() / 1000 - 60,
+      });
+    }));
+    await runCloudScheduled(env);
+    const daily = digestRows()[0];
+    expect(daily.sealed_news).not.toContain("Trial headline");
+    await callback(daily, "news");
+    expect(telegramCalls.at(-1)?.body.text).toContain("Trial headline &lt;safe&gt;");
+    await command("/list");
+    await command("/waiting #1");
+    expect(requests).toBe(2);
+    for (const row of digestRows()) expect((await unseal(env, row.id, row.sealed_news!))[0]).toContain("Trial headline");
+    vi.setSystemTime(new Date(Date.now() + 86400000));
+    await callback(daily, "outlook");
+    await callback(daily, "news");
+    expect(requests).toBe(2);
+    expect(telegramCalls.at(-1)?.body.text).toContain("Trial headline");
+    await runCloudScheduled(env);
+    expect(requests).toBe(4);
+  });
+  it("delivers the daily brief without a bridge snapshot even when news fails", async () => {
+    env.NEWS_TRIAL_ENABLED = "true";
+    await database.prepare("DELETE FROM cloud_snapshot").run();
+    const telegram = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      if (url.startsWith("https://hacker-news.firebaseio.com/")) throw new Error("source down");
+      return telegram(url, init);
+    }));
+    await runCloudScheduled(env);
+    const row = digestRows()[0];
+    expect(row.message_id).toBeGreaterThan(0);
+    await callback(row, "news");
+    expect(telegramCalls.at(-1)?.body.text).toContain("News could not be loaded");
+    await runCloudScheduled(env);
+    expect(digestRows()).toHaveLength(1);
   });
   it("rejects forged users, chats, message IDs, views, namespaces and webhook secrets", async () => {
     await command("/list"); const row = digestRows()[0];

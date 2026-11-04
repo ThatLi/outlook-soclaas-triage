@@ -4,12 +4,14 @@ import { singaporeClock } from "./index";
 import { TelegramFailure, telegramRequest } from "./telegram-api";
 import { annotation, digestGroups, effectiveStates, feedbackLabel, type DigestGroup, type TaskEvent } from "./task-feedback";
 import type { BridgeSnapshot, CloudTask } from "./cloud";
+import { fetchNews } from "./news";
 
 export interface DigestRow {
   id: string; digest_date: string; message_id: number | null; view: string; page: number;
   sealed_pages: string; dirty: number; disabled: number; retry_at: number; last_payload_sha256: string | null;
   sealed_layout: string | null; task_ids_json: string; feedback_event: number | null;
   feedback_text: string;
+  sealed_news?: string | null;
 }
 interface DigestLayout { tasks: CloudTask[]; groups: DigestGroup[] }
 export interface DigestCallback {
@@ -17,13 +19,13 @@ export interface DigestCallback {
   message?: { message_id?: number; chat?: { id?: number; type?: string } };
 }
 
-export function digestMessage(row: Pick<DigestRow, "id" | "digest_date" | "view" | "page">, pages: string[], feedback = "") {
+export function digestMessage(row: Pick<DigestRow, "id" | "digest_date" | "view" | "page">, pages: string[], feedback = "", news = "News trial is disabled or no selection was saved for this edition.") {
   const count = Math.max(1, pages.length - 1);
   const page = Math.min(Math.max(0, row.page), count - 1);
   const button = (text: string, view: string, target = 0) => ({ text, callback_data: `digest:${row.id}:${view}:${target}` });
   const rows = [[button("Overview", "overview"), button("Outlook", "outlook"), button("News", "news")]];
   let content = pages[0];
-  if (row.view === "news") content = "📰 <b>News</b>\n\nnot implemented yet";
+  if (row.view === "news") content = news;
   if (row.view === "outlook") {
     content = pages[page + 1] ?? "No active tasks.";
     const navigation = [];
@@ -43,9 +45,15 @@ export async function queueDigest(env: Env, now = new Date()) {
   const groups = digestGroups(pages);
   const ids = groups.flatMap(group => group.ids);
   const layout: DigestLayout | null = data ? { tasks: data.tasks.filter(task => ids.includes(task.id)).map(({ preview, ...task }) => task), groups } : null;
+  let news: string | null = null;
+  if (env.NEWS_TRIAL_ENABLED === "true") {
+    const saved = await env.DB.prepare("SELECT id,sealed_news FROM interactive_digests WHERE digest_date=? AND sealed_news IS NOT NULL ORDER BY rowid LIMIT 1")
+      .bind(singaporeClock(now).date).first<{ id: string; sealed_news: string }>();
+    news = saved ? (await unseal(env, saved.id, saved.sealed_news))[0] : await fetchNews(now);
+  }
   return { id, statements: [
-    env.DB.prepare("INSERT INTO interactive_digests(id,digest_date,sealed_pages,sealed_layout,task_ids_json,dirty) VALUES(?,?,?,?,?,1)")
-      .bind(id, singaporeClock(now).date, await seal(env, id, pages), layout ? await seal(env, id, [JSON.stringify(layout)]) : null, JSON.stringify(ids)),
+    env.DB.prepare("INSERT INTO interactive_digests(id,digest_date,sealed_pages,sealed_layout,task_ids_json,sealed_news,dirty) VALUES(?,?,?,?,?,?,1)")
+      .bind(id, singaporeClock(now).date, await seal(env, id, pages), layout ? await seal(env, id, [JSON.stringify(layout)]) : null, JSON.stringify(ids), news === null ? null : await seal(env, id, [news])),
     env.DB.prepare("INSERT INTO cloud_outbox(id,sealed_chunks,created_at,digest_id) VALUES(?,?,?,?)")
       .bind(id, await seal(env, id, []), now.toISOString(), id),
   ] };
@@ -95,7 +103,8 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
   const event = row.feedback_event === null || row.digest_date !== singaporeClock(now).date ? null
     : await env.DB.prepare("SELECT * FROM cloud_events WHERE id=?").bind(row.feedback_event).first<TaskEvent>();
   const feedback = event ? feedbackLabel(event) : row.feedback_text;
-  const { page, payload } = digestMessage(row, pages, feedback);
+  const news = row.sealed_news ? (await unseal(env, row.id, row.sealed_news))[0] : undefined;
+  const { page, payload } = digestMessage(row, pages, feedback, news);
   // Save the last generated edition even when Telegram is temporarily unavailable.
   await env.DB.prepare("UPDATE interactive_digests SET sealed_pages=?,page=?,feedback_text=? WHERE id=?")
     .bind(await seal(env, row.id, pages), page, feedback, row.id).run();
