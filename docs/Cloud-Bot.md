@@ -37,26 +37,29 @@ mailbox snapshot and current cloud task states. Sync timestamps and classificati
 warnings remain visible. Category totals describe the 24-hour window at snapshot
 preparation, even if Windows has been off for days.
 
-Each scheduled digest and `/list` digest is one interactive message. Use
-**Overview**, **Outlook**, and **News** to switch views. Outlook pages show real
-task IDs and only show Previous/Next when another page exists. Overdue,
-urgent/due-today, and upcoming-deadline sections
-each start on separate Outlook pages. Other open actions and waiting/follow-up
-share a page when they fit, retaining separate headings. Oversized sections have
-their own continuation pages; empty sections are omitted. The optional News trial
-shows a saved daily selection from Hacker News (see below). Keep using typed `/waiting`, `/reopen`, `/done`,
+Each scheduled digest and `/list` digest is a rich message with collapsed priority
+sections. Tap a heading to expand its tasks directly in Telegram, without a bot
+request or message reload. Headings show counts; empty priorities show zero-count
+lines. Task IDs, deadlines, senders, and status annotations remain available.
+The date, open-task total, sync timestamp, warnings, and command feedback stay
+visible. Recent activity and enabled News are separate collapsed sections.
+Large digests arrive immediately as numbered continuation messages, with no
+navigation buttons. Each part stays below 30,000 UTF-8 bytes and 400 blocks;
+long tasks have labeled fragments retaining their IDs. Keep using typed `/waiting`, `/reopen`, `/done`,
 and `/dismiss` commands: all digests from the current Singapore date update
-automatically, preserving the selected view. `/done` and `/dismiss` update only
+automatically. Telegram may reset expanded sections after an update. `/done` and `/dismiss` update only
 after each successful Outlook acknowledgement. Earlier editions keep their last
-saved content and remain navigable. `/list` synchronization refreshes its existing
+saved content and remain readable. Previously sent legacy messages retain their
+Overview/Outlook/News buttons. `/list` synchronization refreshes its existing
 digest. Its pending and completion notices are temporary: both are deleted after
 synchronization succeeds and the digest is current. Failed runs keep their
 actionable replies. The interactive digest and the user's `/list` command remain.
 Failed edits retry on later bot, bridge or scheduled runs. Telegram rate limits
 can delay updates. Deleted or inaccessible digest messages are retired without
 blocking other deliveries.
-Unchanged visible text and buttons do not trigger a Telegram edit; saved pages
-still refresh so navigating to another section shows current content.
+Unchanged parts do not trigger a Telegram edit. Successful parts are checkpointed
+individually; failed continuations resume without resending completed parts.
+Surplus continuations are removed only after replacement content succeeds.
 
 ### Quiet task feedback (PR #13)
 
@@ -79,9 +82,9 @@ separate queued/completed replies when an editable digest covers the tasks.
 Rows stay in their original sections, including completed and dismissed rows;
 totals show remaining open/waiting tasks. A fresh digest regroups tasks and omits
 closed tasks. Snapshot refreshes update the original rows' descriptions and
-metadata. New tasks appear in the next fresh digest. A short feedback footer also
-shows command progress when the selected page does not contain the affected
-tasks, preserving the selected view. Partial successes keep their checkmarks,
+metadata. New tasks appear in the next fresh digest. Visible command feedback
+shows progress even when the affected section is collapsed. Command cleanup waits
+until all affected digest parts are current. Partial successes keep their checkmarks,
 and newer waiting/reopen changes take precedence over older Outlook confirmations.
 
 If no current editable digest contains a task, the bot sends a concise fallback
@@ -104,6 +107,13 @@ deploying. The original `0003_digest_interactions.sql` migration from PR #13 is
 retained for installations that already applied it. Existing interactive messages
 acquire their retained layout on first refresh; rows removed before this upgrade
 cannot have their original membership reconstructed. No bridge change is needed.
+
+For expandable rich digests, apply `0008_rich_digests.sql` before deploying the
+updated Worker. Existing records default to the legacy format; new editions use
+rich sections. Keep the additive schema when rolling back. No new dependency,
+setting, or Python bridge change is required. Before rollout, inspect a sample on
+your daily Telegram clients and confirm expanding sections produces no callback
+requests. Automated tests cannot establish client rendering or expansion behavior.
 For temporary `/list` acknowledgement cleanup, apply `0006_list_reply_cleanup.sql`
 before deployment. Only newly sent tracked notices can be deleted automatically;
 previously untracked notice IDs cannot be recovered. Telegram's deletion age
@@ -111,7 +121,8 @@ limit and best-effort cleanup rules also apply to these notices.
 
 ## Daily news trial
 
-The trial fills the existing **News** tab in the 08:00 Asia/Singapore daily brief.
+The trial fills a collapsed **News** section in the 08:00 Asia/Singapore daily brief
+(the News tab on previously sent legacy editions).
 It selects up to five stories posted within the previous 24 hours, preserving
 Hacker News ranking among the first ten candidates. This is a technology-focused
 trial, not a general or Singapore news service. Headlines link to HN discussions;
@@ -162,7 +173,7 @@ date rollover, frozen history, operation without a bridge snapshot, source failu
 source rank, invalid/deleted/stale entries, and hostile or oversized input.
 
 Before judging the trial successful, observe at least two morning deliveries with
-Windows off, use News/Outlook navigation and `/list`, and check Worker CPU and
+Windows off, expand the task and News sections and use `/list`, and check Worker CPU and
 errors. Evaluate relevance, empty editions, and source reliability before adding
 other publishers or AI summaries. Automated tests do not establish production
 free-tier CPU headroom or live Telegram delivery.

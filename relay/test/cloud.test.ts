@@ -6,11 +6,30 @@ import { parseCloudCommand, renderDigest, runCloudScheduled, textChunks, type Br
 import { digestMessage, type DigestRow } from "../src/interactive-digest";
 import { unseal } from "../src/cloud";
 import { digestGroups } from "../src/task-feedback";
+import { renderRichDigest } from "../src/rich-digest";
+
+const legacyFixture = vi.hoisted(() => ({ enabled: false }));
+// Exercise saved pre-upgrade editions through the real legacy delivery and callback paths.
+vi.mock("../src/interactive-digest", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/interactive-digest")>();
+  return { ...actual, queueDigest: async (env: Env, now = new Date()) => {
+    const queued = await actual.queueDigest(env, now);
+    if (legacyFixture.enabled) {
+      const { snapshot, renderDigest, seal } = await import("../src/cloud");
+      const data = await snapshot(env);
+      const pages = data ? renderDigest(data, now) : ["No bridge snapshot yet. The digest will become available after Windows publishes one.", "No active tasks."];
+      queued.statements.push(env.DB.prepare("UPDATE interactive_digests SET format='legacy',sealed_pages=? WHERE id=?")
+        .bind(await seal(env, queued.id, pages), queued.id));
+    }
+    return queued;
+  } };
+});
 
 // Run production SQL against SQLite rather than matching SQL strings in a mock.
 class SQLiteD1 {
   db = new DatabaseSync(":memory:");
   constructor() {
+    this.db.exec("PRAGMA foreign_keys=ON");
     this.db.exec(readFileSync(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0002_cloud_bot.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0003_digest_interactions.sql", import.meta.url), "utf8"));
@@ -19,6 +38,7 @@ class SQLiteD1 {
     this.db.exec(readFileSync(new URL("../migrations/0005_quiet_task_feedback.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0006_list_reply_cleanup.sql", import.meta.url), "utf8"));
     this.db.exec(readFileSync(new URL("../migrations/0007_news_trial.sql", import.meta.url), "utf8"));
+    this.db.exec(readFileSync(new URL("../migrations/0008_rich_digests.sql", import.meta.url), "utf8"));
   }
   prepare(sql: string) {
     let args: (string | number | null)[] = [];
@@ -95,6 +115,7 @@ function telegramMock() {
     const method = url.split("/").at(-1)!;
     telegramCalls.push({ method, body });
     if (method === "sendMessage") sent.push(body.text);
+    if (method === "sendRichMessage") sent.push(body.rich_message.html);
     return Response.json({ ok: true, result: { message_id: body.message_id ?? ++nextMessage } });
   });
 }
@@ -132,6 +153,7 @@ async function callback(row: DigestRow, view = "overview", page = 0, changes = {
 }
 
 beforeEach(async () => {
+  legacyFixture.enabled = false;
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-11-01T02:00:00Z"));
   database = new SQLiteD1(); sent = []; sequence = 100; telegramCalls = []; nextMessage = 1000;
@@ -221,6 +243,7 @@ describe("temporary /list acknowledgement messages", () => {
 });
 
 describe("PR #13 quiet task feedback with interactive pages", () => {
+  beforeEach(() => { legacyFixture.enabled = true; });
   async function trackedDigest() {
     await command("/list");
     await ack({ event_id: (await poll()).job!.id });
@@ -390,6 +413,7 @@ describe("PR #13 quiet task feedback with interactive pages", () => {
 });
 
 describe("interactive digests", () => {
+  beforeEach(() => { legacyFixture.enabled = true; });
   it("skips unchanged visible messages while saving refreshed off-screen pages", async () => {
     await command("/list");
     const row = digestRows()[0];
@@ -679,9 +703,8 @@ describe("cloud bot with real SQLite", () => {
   it("queues list while returning a dated digest and preserves task ids", async () => {
     await command("/list");
     expect(sent.join("\n")).toContain("Last successful Outlook sync");
-    const row = digestRows()[0];
-    await callback(row, "outlook");
-    expect(telegramCalls.at(-1)?.body.text).toContain("<code>#1</code> Private task 1 &lt;review&gt;");
+    expect(telegramCalls.find(call => call.method === "sendRichMessage")?.body.rich_message.html)
+      .toContain("<code>#1</code> Private task 1 &lt;review&gt;");
     expect((await poll()).job?.task_ids).toEqual([]);
     await command("/read #1 #1 2");
     const pending = database.db.prepare("SELECT task_ids FROM cloud_events WHERE action='read'").get();
@@ -731,7 +754,7 @@ describe("cloud bot with real SQLite", () => {
     expect(sent.length).toBe(start);
     await runCloudScheduled(env, new Date("2026-10-21T00:00:00Z"));
     const count = sent.length;
-    expect(sent.slice(start).join("\n")).toContain("<b>Inbox brief — 2026-10-21</b>");
+    expect(sent.slice(start).join("\n")).toContain("<h2>📬 Daily brief — 2026-10-21</h2>");
     const pages = await storedPages(digestRows()[0]);
     expect(pages.join("\n")).toContain("<b>WAITING / FOLLOW-UP · 1</b>");
     expect(pages.join("\n")).toContain("<code>#1</code>");
@@ -754,6 +777,220 @@ describe("cloud bot with real SQLite", () => {
     await publish(data); await command("/show #1");
     expect(sent.at(-1)).toContain("&lt;secret&gt; &amp; text");
     expect(database.db.prepare("SELECT envelope_json FROM cloud_snapshot").get()?.envelope_json).not.toContain("<secret>");
+  });
+});
+
+describe("rich digests", () => {
+  const richCalls = () => telegramCalls.filter(call => call.body.rich_message);
+  const parts = (id = digestRows()[0].id) => database.db.prepare("SELECT * FROM interactive_digest_parts WHERE digest_id=? ORDER BY part_index").all(id);
+  function largeFixture() {
+    const data = fixture();
+    data.tasks = Array.from({ length: 65 }, (_, index) => ({ ...data.tasks[0], id: index + 1, description: `Task ${index + 1} ` + "Review this action. ".repeat(65) }));
+    return data;
+  }
+  it("renders every priority collapsed with counts, escaped tasks, visible health and collapsed activity", () => {
+    const data = allSectionsFixture();
+    data.health.last_run = { status: "failed" }; data.health.pending_or_failed = 2;
+    data.tasks[0].sender_name = "A & B <team>";
+    const rendered = renderRichDigest(data, new Date(), undefined, new Map(), "✅ Completed: /done · 1/1 confirmed");
+    expect(rendered).toHaveLength(1);
+    const html = rendered[0];
+    expect(html.match(/<details>/g)).toHaveLength(6);
+    expect(html).not.toMatch(/<details\s+open|callback_data|inline_keyboard/);
+    for (const id of [1, 2, 3, 4, 5]) expect(html).toContain(`<code>#${id}</code>`);
+    expect(html).toContain("OVERDUE · 1"); expect(html).toContain("WAITING / FOLLOW-UP · 1");
+    expect(html).toContain("&lt;review&gt;"); expect(html).toContain("A &amp; B &lt;team&gt;");
+    const visible = html.slice(0, html.indexOf("<details>"));
+    expect(visible).toContain("5 open tasks"); expect(visible).toContain("latest mailbox synchronization did not finish");
+    expect(visible).toContain("2</b> pending or failed"); expect(visible).toContain("✅ Completed");
+    expect(visible).toContain("Last successful Outlook sync");
+    expect(html).toContain("<details><summary>📊 Recent activity");
+    expect(html).not.toContain("📰 News");
+  });
+  it("shows empty priorities as zero-count lines and includes enabled news collapsed", () => {
+    const data = fixture(); data.tasks = [];
+    const html = renderRichDigest(data, new Date(), undefined, new Map(), "", "Trial news")[0];
+    expect(html).toContain("No active tasks."); expect(html).toContain("OVERDUE · 0");
+    expect(html.match(/<details>/g)).toHaveLength(2);
+    expect(html).toContain("<details><summary>📰 News</summary><p>Trial news</p></details>");
+  });
+  it("keeps Unicode and long fragments complete under the byte and block budgets", () => {
+    const data = fixture();
+    data.tasks = data.tasks.slice(0, 1);
+    data.tasks[0].description = "<邮件&😀>".repeat(7000);
+    data.tasks[0].sender_name = "发送者😀".repeat(2000);
+    const rendered = renderRichDigest(data);
+    expect(rendered.length).toBeGreaterThan(2);
+    const all = rendered.join("");
+    for (const character of ["邮", "件"]) expect(all.split(character).length - 1).toBe(7000);
+    for (const character of ["发", "送", "者"]) expect(all.split(character).length - 1).toBe(2000);
+    expect(all.match(/😀/g)).toHaveLength(9000);
+    expect(all.match(/&lt;/g)).toHaveLength(7000);
+    expect(all.match(/&amp;/g)).toHaveLength(7000);
+    expect(all.match(/&gt;/g)).toHaveLength(7000);
+    for (const [index, html] of rendered.entries()) {
+      expect(new TextEncoder().encode(html).length).toBeLessThanOrEqual(30000);
+      expect(html.match(/<(?:h2|p|details|summary)>/g)!.length).toBeLessThanOrEqual(400);
+      expect(html.match(/<details>/g)?.length ?? 0).toBe(html.match(/<\/details>/g)?.length ?? 0);
+      expect(html.match(/<p>/g)?.length ?? 0).toBe(html.match(/<\/p>/g)?.length ?? 0);
+      expect(html).not.toContain("�");
+      expect(html).toContain(`· ${index + 1} / ${rendered.length}`);
+      expect(html).toContain("<code>#1</code>");
+    }
+    expect(all).toContain("(continued)");
+  });
+  it("also splits many short tasks at the block budget without losing task IDs", () => {
+    const data = fixture();
+    data.tasks = Array.from({ length: 900 }, (_, index) => ({ ...data.tasks[0], id: index + 1, description: "X", sender_name: "", deadline: null }));
+    const rendered = renderRichDigest(data);
+    expect(rendered.length).toBeGreaterThan(2);
+    for (const html of rendered) expect(html.match(/<(?:h2|p|details|summary)>/g)!.length).toBeLessThanOrEqual(400);
+    const ids = [...rendered.join("").matchAll(/<code>#(\d+)<\/code>/g)].map(match => Number(match[1]));
+    expect(ids).toEqual(data.tasks.map(task => task.id));
+  });
+  it("sends a complete rich digest, ignores navigation callbacks and suppresses unchanged edits", async () => {
+    await command("/list");
+    const row = digestRows()[0];
+    expect(row.format).toBe("rich"); expect(parts()).toHaveLength(1);
+    expect(richCalls()).toHaveLength(1); expect(richCalls()[0].method).toBe("sendRichMessage");
+    expect(richCalls()[0].body).not.toHaveProperty("reply_markup");
+    expect(richCalls()[0].body).not.toHaveProperty("parse_mode");
+    expect(richCalls()[0].body.rich_message.html).toContain("<code>#2</code>");
+    expect(row.sealed_pages).not.toContain("Private task"); expect(row.sealed_layout).not.toContain("Private task");
+    telegramCalls = [];
+    await callback(row, "outlook"); await publish(); await poll();
+    expect(richCalls()).toHaveLength(0);
+    expect(telegramCalls.some(call => call.method === "answerCallbackQuery")).toBe(false);
+    expect((await storedPages(digestRows()[0]))[0]).toContain("<details>");
+  });
+  it("retains section membership, pending feedback, checkmarks and quiet command cleanup", async () => {
+    await command("/list"); await ack({ event_id: (await poll()).job!.id });
+    await command("/waiting #1");
+    let html = (await storedPages(digestRows()[0])).join("");
+    expect(html).toContain("OVERDUE · 2"); expect(html).toContain("☐ <code>#1</code> <i>· 💤 Waiting</i>");
+    await command("/reopen #1"); await command("/read #1");
+    let event = (await poll()).job!; await ack({ event_id: event.id, task_id: 1 });
+    expect((await storedPages(digestRows()[0])).join("")).toContain("Email read</i>");
+    await command("/done #1 #2", 900);
+    expect(telegramCalls.at(-1)?.method).toBe("deleteMessage");
+    html = (await storedPages(digestRows()[0])).join("");
+    expect(html).toContain("Done pending</i>");
+    expect(html.indexOf("Pending Outlook confirmation")).toBeLessThan(html.indexOf("<details>"));
+    event = (await poll()).job!;
+    await ack({ event_id: event.id, task_id: 1 }); await ack({ event_id: event.id, task_id: 2 });
+    html = (await storedPages(digestRows()[0])).join("");
+    expect(html).toContain("☑ <code>#1</code>"); expect(html).toContain("☑ <code>#2</code>");
+    expect(html).toContain("0 remaining / 2"); expect(html).not.toContain("Done pending");
+    expect(digestRows()[0].dirty).toBe(0);
+  });
+  it("saves partial sends and resumes remaining parts without resending successful parts", async () => {
+    await publish(largeFixture());
+    const normal = telegramMock(); let attempts = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith("sendRichMessage") && ++attempts === 2) return Response.json({ ok: false }, { status: 503 });
+      return normal(url, init);
+    }));
+    await command("/list");
+    const row = digestRows()[0];
+    expect(row.dirty).toBe(1); expect(row.message_id).toBeGreaterThan(0); expect(parts()).toHaveLength(1);
+    vi.setSystemTime(new Date(Date.now() + 6000)); vi.stubGlobal("fetch", normal);
+    await poll();
+    const saved = await storedPages(digestRows()[0]);
+    expect(saved.length).toBeGreaterThan(2); expect(parts()).toHaveLength(saved.length);
+    expect(richCalls().filter(call => call.method === "sendRichMessage")).toHaveLength(saved.length);
+    expect(richCalls().filter(call => call.method === "editMessageText")).toHaveLength(0);
+    expect(digestRows()[0].dirty).toBe(0); expect(digestRows()[0].message_id).toBe(row.message_id);
+    const count = richCalls().length; await poll(); expect(richCalls()).toHaveLength(count);
+  });
+  it("edits only changed parts and retries failed edits without claiming success", async () => {
+    const data = largeFixture(); await publish(data); await command("/list");
+    const before = parts().map(part => part.payload_sha256);
+    data.tasks.at(-1)!.description = data.tasks.at(-1)!.description.replace("Review", "Check!");
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("editMessageText")
+      ? Response.json({ ok: false }, { status: 503 }) : normal(url, init)));
+    await publish(data);
+    expect(digestRows()[0].dirty).toBe(1); expect(parts().map(part => part.payload_sha256)).toEqual(before);
+    telegramCalls = []; vi.setSystemTime(new Date(Date.now() + 6000)); vi.stubGlobal("fetch", normal);
+    await poll();
+    expect(richCalls()).toHaveLength(1); expect(richCalls()[0].method).toBe("editMessageText");
+    expect(richCalls()[0].body.message_id).toBe(parts().at(-1)!.message_id);
+    expect(digestRows()[0].dirty).toBe(0);
+  });
+  it("keeps command cleanup pending until every continuation edit succeeds", async () => {
+    await publish(largeFixture()); await command("/list"); await ack({ event_id: (await poll()).job!.id });
+    const last = parts().at(-1)!.message_id; const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("editMessageText") && JSON.parse(String(init.body)).message_id === last
+      ? Response.json({ ok: false }, { status: 503 }) : normal(url, init)));
+    telegramCalls = []; await command("/waiting #65", 950);
+    expect(digestRows()[0].dirty).toBe(1);
+    expect(telegramCalls.some(call => call.method === "deleteMessage")).toBe(false);
+    vi.setSystemTime(new Date(Date.now() + 6000)); vi.stubGlobal("fetch", normal); await poll();
+    expect(digestRows()[0].dirty).toBe(0);
+    expect(telegramCalls.at(-1)?.body.message_id).toBe(950);
+  });
+  it("removes surplus parts after replacement succeeds and retries rate-limited cleanup", async () => {
+    const data = largeFixture(); await publish(data); await command("/list");
+    const old = parts(); expect(old.length).toBeGreaterThan(2);
+    data.tasks.forEach(task => { task.description = "Short action"; });
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("deleteMessage")
+      ? Response.json({ ok: false, parameters: { retry_after: 30 } }, { status: 429 }) : normal(url, init)));
+    telegramCalls = []; await publish(data);
+    expect(digestRows()[0].dirty).toBe(1); expect(parts()).toHaveLength(old.length);
+    expect(richCalls()).toHaveLength(1);
+    const count = telegramCalls.length; await poll(); expect(telegramCalls).toHaveLength(count);
+    vi.setSystemTime(new Date(Date.now() + 31000)); vi.stubGlobal("fetch", normal); await poll();
+    expect(parts()).toHaveLength(1); expect(digestRows()[0].dirty).toBe(0);
+    expect(richCalls()).toHaveLength(1);
+    expect(telegramCalls.filter(call => call.method === "deleteMessage").map(call => call.body.message_id))
+      .toEqual(old.slice(1).map(part => part.message_id));
+  });
+  it("tolerates an already-deleted surplus continuation", async () => {
+    const data = largeFixture(); await publish(data); await command("/list");
+    data.tasks.forEach(task => { task.description = "Short action"; });
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("deleteMessage")
+      ? Response.json({ ok: false, description: "Bad Request: message to delete not found" }, { status: 400 }) : normal(url, init)));
+    await publish(data);
+    expect(parts()).toHaveLength(1); expect(digestRows()[0].dirty).toBe(0); expect(digestRows()[0].disabled).toBe(0);
+  });
+  it("keeps a failed first send frozen when retrying on the next day", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ ok: false }, { status: 503 })));
+    await command("/list");
+    const row = digestRows()[0]; const saved = await storedPages(row);
+    vi.setSystemTime(new Date(Date.now() + 86400000)); vi.stubGlobal("fetch", telegramMock());
+    const data = fixture(); data.tasks[0].description = "Next-day change"; await publish(data); await poll();
+    expect(richCalls()[0].body.rich_message.html).toBe(saved[0]);
+    expect(richCalls()[0].body.rich_message.html).toContain("Private task 1");
+    expect(richCalls()[0].body.rich_message.html).not.toContain("Next-day change");
+  });
+  it("delivers missing-snapshot warnings and frozen news without navigation", async () => {
+    await database.prepare("DELETE FROM cloud_snapshot").run(); env.NEWS_TRIAL_ENABLED = "true";
+    const normal = telegramMock(); let requests = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      if (url.startsWith("https://hacker-news.firebaseio.com/")) { requests++; throw new Error("unavailable"); }
+      return normal(url, init);
+    }));
+    await command("/list");
+    expect(richCalls()[0].body.rich_message.html).toContain("No bridge snapshot yet");
+    expect(richCalls()[0].body.rich_message.html).toContain("News could not be loaded");
+    const initialRequests = requests;
+    await publish();
+    expect((await storedPages(digestRows()[0]))[0]).toContain("Private task 1");
+    expect(requests).toBe(initialRequests);
+    await command("/list"); expect(requests).toBe(initialRequests);
+    expect(digestRows().every(row => row.sealed_news && !row.sealed_news.includes("News could not"))).toBe(true);
+  });
+  it("defaults migrated records to legacy and cascades continuation-record retention cleanup", async () => {
+    await database.prepare("INSERT INTO interactive_digests(id,digest_date,sealed_pages) VALUES('legacy','2026-11-01','encrypted')").run();
+    expect(digestRows().find(row => row.id === "legacy")!.format).toBe("legacy");
+    await database.prepare("DELETE FROM interactive_digests WHERE id='legacy'").run();
+    await command("/list"); await ack({ event_id: (await poll()).job!.id });
+    const id = digestRows()[0].id;
+    expect(parts(id)).toHaveLength(1);
+    vi.setSystemTime(new Date(Date.now() + 31 * 86400000)); await runCloudScheduled(env);
+    expect(parts(id)).toHaveLength(0);
   });
 });
 

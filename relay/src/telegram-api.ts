@@ -17,6 +17,7 @@ export async function telegramRequest(env: Env, method: string, body: object): P
   const description = result?.description ?? "";
   const code = result?.error_code ?? response.status;
   if (method === "editMessageText" && code === 400 && /message is not modified/i.test(description)) return {};
+  if (method === "deleteMessage" && code === 400 && /message to delete not found/i.test(description)) return {};
   if (!response.ok || !result?.ok) throw new TelegramFailure(code,
     Math.max(0, Number(result?.parameters?.retry_after) || 0),
     code === 403 || (code === 400 && /message to edit not found|message can't be edited|chat not found/i.test(description)));

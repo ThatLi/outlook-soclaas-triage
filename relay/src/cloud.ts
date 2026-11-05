@@ -139,7 +139,7 @@ function packDigestBlocks(blocks: string[], limit = 3000): string[] {
   return messages;
 }
 
-function digestTaskParts(task: CloudTask, today: string, annotation = ""): string[] {
+export function digestTaskParts(task: CloudTask, today: string, annotation = ""): string[] {
   const id = `<code>#${task.id}</code>`;
   const parts = textChunks(task.description, 1800).map((description, index) =>
     `${index ? "↳" : task.status === "done" ? "☑" : task.status === "dismissed" ? "☒" : "☐"} ${id}${index ? " <i>(continued)</i>" : annotation} ${description}`);
@@ -160,7 +160,7 @@ function digestTaskParts(task: CloudTask, today: string, annotation = ""): strin
   return parts;
 }
 
-function remainingLabel(tasks: CloudTask[]): string {
+export function remainingLabel(tasks: CloudTask[]): string {
   const active = tasks.filter(task => ["open", "waiting"].includes(task.status)).length;
   return active === tasks.length ? String(active) : `${active} remaining / ${tasks.length}`;
 }
@@ -174,7 +174,7 @@ function digestSection(heading: string, emoji: string, tasks: CloudTask[], today
   return groups.map((group, index) => `${title}${groups.length > 1 ? ` — PART ${index + 1} OF ${groups.length}` : ""}\n\n${group}`);
 }
 
-export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>()): string[] {
+export function digestTaskGroups(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[]): [string, CloudTask[]][] {
   const today = singaporeClock(now).date;
   const horizon = new Date(Date.parse(today) + data.horizon_days * 86400000).toISOString().slice(0, 10);
   let groups: [string, CloudTask[]][] = [
@@ -195,6 +195,12 @@ export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups
     const lookup = new Map(data.tasks.map(task => [task.id, task]));
     groups = fixedGroups.map(group => [group.heading, group.ids.map(id => lookup.get(id)).filter((task): task is CloudTask => Boolean(task))]);
   }
+  return groups;
+}
+
+export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>()): string[] {
+  const today = singaporeClock(now).date;
+  const groups = digestTaskGroups(data, now, fixedGroups);
   const emojis = ["🔴", "🟠", "🟡", "⚪", "💤"];
   const summary = [
     `📬 <b>Inbox brief — ${today}</b>`,

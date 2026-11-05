@@ -5,7 +5,7 @@
   "workers_dev": true,
   "compatibility_date": "2026-10-01",
   "vars": {
-    // Requires all migrations through 0007; set false to restore the legacy outbound relay.
+    // Requires all migrations through 0008; set false to restore the legacy outbound relay.
     "CLOUD_BOT_ENABLED": "true",
     "NEWS_TRIAL_ENABLED": "true"
   },
