@@ -6,6 +6,7 @@ import { parseCloudCommand, renderDigest, runCloudScheduled, textChunks, type Br
 import { digestMessage, type DigestRow } from "../src/interactive-digest";
 import { unseal } from "../src/cloud";
 import { digestGroups } from "../src/task-feedback";
+import { renderRichDigest } from "../src/rich-digest";
 
 // Run production SQL against SQLite rather than matching SQL strings in a mock.
 class SQLiteD1 {
@@ -754,6 +755,69 @@ describe("cloud bot with real SQLite", () => {
     await publish(data); await command("/show #1");
     expect(sent.at(-1)).toContain("&lt;secret&gt; &amp; text");
     expect(database.db.prepare("SELECT envelope_json FROM cloud_snapshot").get()?.envelope_json).not.toContain("<secret>");
+  });
+});
+
+describe("rich digest rendering", () => {
+  it("renders every priority collapsed with counts, escaped tasks, visible health and collapsed activity", () => {
+    const data = allSectionsFixture();
+    data.health.last_run = { status: "failed" }; data.health.pending_or_failed = 2;
+    data.tasks[0].sender_name = "A & B <team>";
+    const rendered = renderRichDigest(data, new Date(), undefined, new Map(), "✅ Completed: /done · 1/1 confirmed");
+    expect(rendered).toHaveLength(1);
+    const html = rendered[0];
+    expect(html.match(/<details>/g)).toHaveLength(6);
+    expect(html).not.toMatch(/<details\s+open|callback_data|inline_keyboard/);
+    for (const id of [1, 2, 3, 4, 5]) expect(html).toContain(`<code>#${id}</code>`);
+    expect(html).toContain("OVERDUE · 1"); expect(html).toContain("WAITING / FOLLOW-UP · 1");
+    expect(html).toContain("&lt;review&gt;"); expect(html).toContain("A &amp; B &lt;team&gt;");
+    const visible = html.slice(0, html.indexOf("<details>"));
+    expect(visible).toContain("5 open tasks"); expect(visible).toContain("latest mailbox synchronization did not finish");
+    expect(visible).toContain("2</b> pending or failed"); expect(visible).toContain("✅ Completed");
+    expect(visible).toContain("Last successful Outlook sync");
+    expect(html).toContain("<details><summary>📊 Recent activity");
+    expect(html).not.toContain("📰 News");
+  });
+  it("shows empty priorities as zero-count lines and includes enabled news collapsed", () => {
+    const data = fixture(); data.tasks = [];
+    const html = renderRichDigest(data, new Date(), undefined, new Map(), "", "Trial news")[0];
+    expect(html).toContain("No active tasks."); expect(html).toContain("OVERDUE · 0");
+    expect(html.match(/<details>/g)).toHaveLength(2);
+    expect(html).toContain("<details><summary>📰 News</summary><p>Trial news</p></details>");
+  });
+  it("keeps Unicode and long fragments complete under the byte and block budgets", () => {
+    const data = fixture();
+    data.tasks = data.tasks.slice(0, 1);
+    data.tasks[0].description = "<邮件&😀>".repeat(7000);
+    data.tasks[0].sender_name = "发送者😀".repeat(2000);
+    const rendered = renderRichDigest(data);
+    expect(rendered.length).toBeGreaterThan(2);
+    const all = rendered.join("");
+    for (const character of ["邮", "件"]) expect(all.split(character).length - 1).toBe(7000);
+    for (const character of ["发", "送", "者"]) expect(all.split(character).length - 1).toBe(2000);
+    expect(all.match(/😀/g)).toHaveLength(9000);
+    expect(all.match(/&lt;/g)).toHaveLength(7000);
+    expect(all.match(/&amp;/g)).toHaveLength(7000);
+    expect(all.match(/&gt;/g)).toHaveLength(7000);
+    for (const [index, html] of rendered.entries()) {
+      expect(new TextEncoder().encode(html).length).toBeLessThanOrEqual(30000);
+      expect(html.match(/<(?:h2|p|details|summary)>/g)!.length).toBeLessThanOrEqual(400);
+      expect(html.match(/<details>/g)?.length ?? 0).toBe(html.match(/<\/details>/g)?.length ?? 0);
+      expect(html.match(/<p>/g)?.length ?? 0).toBe(html.match(/<\/p>/g)?.length ?? 0);
+      expect(html).not.toContain("�");
+      expect(html).toContain(`· ${index + 1} / ${rendered.length}`);
+      expect(html).toContain("<code>#1</code>");
+    }
+    expect(all).toContain("(continued)");
+  });
+  it("also splits many short tasks at the block budget without losing task IDs", () => {
+    const data = fixture();
+    data.tasks = Array.from({ length: 900 }, (_, index) => ({ ...data.tasks[0], id: index + 1, description: "X", sender_name: "", deadline: null }));
+    const rendered = renderRichDigest(data);
+    expect(rendered.length).toBeGreaterThan(2);
+    for (const html of rendered) expect(html.match(/<(?:h2|p|details|summary)>/g)!.length).toBeLessThanOrEqual(400);
+    const ids = [...rendered.join("").matchAll(/<code>#(\d+)<\/code>/g)].map(match => Number(match[1]));
+    expect(ids).toEqual(data.tasks.map(task => task.id));
   });
 });
 
