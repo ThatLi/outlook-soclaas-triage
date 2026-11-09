@@ -277,3 +277,23 @@ into SQLite. Stop/disable Cloud Bridge, run `cloud-webhook-disable`, set the loc
 cloud setting to false, set the Worker flag to false and redeploy. Re-enable the
 original Windows schedules and run `relay-publish`. If Windows cannot reconnect,
 preserve cloud D1 first: newer edits and pending work are not yet in local SQLite.
+## Informational digest support
+
+Deploy the updated relay before upgrading and reconnecting the Windows bridge.
+No cloud database migration is required for informational reads; their separate
+internal action uses the existing command queue and completion receipts.
+
+The brief includes unread informational emails received within the last 72 hours.
+Use `/show #i42` for a cached original-body preview and `/read #i42` (or several
+informational references) to queue marking them read. Task IDs and informational
+IDs must be sent separately. Informational emails do not support task workflow
+commands such as `/done` or `/waiting`.
+
+Entries stay visible while a read is queued. The Windows bridge publishes confirmed
+read status before acknowledging completion. Partial successes are retained and
+retries are safe. Reading directly in Outlook is reflected after synchronization.
+Cloud previews require `--cache-previews`; summary delivery does not.
+
+New editions select the current 72-hour window. An existing edition preserves its
+original summaries and membership, while confirmed reads can remove entries from
+current editions. Older delivered editions remain frozen.

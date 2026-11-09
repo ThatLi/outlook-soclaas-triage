@@ -13,9 +13,14 @@ export interface CloudTask {
   id: number; status: Status; description: string; deadline: string | null; urgency: string;
   sender_name: string; sender_address: string; subject: string; preview?: string;
 }
+export interface InformationEmail {
+  id: number; summary: string; subject: string; sender_name: string; sender_address: string;
+  received_at: string; is_read: boolean | null; preview?: string;
+}
 export interface BridgeSnapshot {
   dataset_id: string;
   tasks: CloudTask[];
+  information?: InformationEmail[];
   horizon_days: number;
   health: { last_sync: string | null; last_run: { status: string } | null; pending_or_failed: number };
   counts: Record<string, number | null>;
@@ -25,7 +30,7 @@ interface Event {
   id: number; action: string; task_ids: string; completed_ids: string; retry_limit: number;
   status: string; created_at: string; digest_id: string | null;
 }
-interface Command { action: string; ids: number[]; option?: string; limit: number }
+interface Command { action: string; ids: number[]; option?: string; limit: number; information?: boolean }
 const statuses = ["open", "waiting", "done", "dismissed"];
 const mailboxActions = ["sync", "list", "retry", "read", "done", "dismiss"];
 const help = [
@@ -38,6 +43,9 @@ const help = [
   "/done #id [...] — mark done after Outlook confirms read",
   "/dismiss #id [...] — dismiss after Outlook confirms read",
   "/show #id — previously cached body preview", "/help — command reference",
+  "/show #i42 — informational email preview",
+  "/read #i42 [#i43 ...] — mark informational emails read; hide them after Outlook confirms",
+  "Informational emails remain for up to 72 hours. Send task and informational IDs separately.",
   "Mailbox work waits until the Windows bridge connects. Scheduled sync: every four hours.",
 ].join("\n");
 
@@ -59,6 +67,12 @@ export function parseCloudCommand(text: string): Command | null {
       ? { ...base, limit } : null;
   }
   const parts = arg?.split(/\s+/) ?? [];
+  if (parts.length && parts.every(p => /^#?i[1-9]\d*$/i.test(p))) {
+    if (!["show", "read"].includes(action) || parts.length > 100) return null;
+    const ids = [...new Set(parts.map(p => Number(p.replace(/^#?i/i, ""))))];
+    if (ids.some(id => !Number.isSafeInteger(id)) || (action === "show" && ids.length !== 1)) return null;
+    return { ...base, ids, information: true };
+  }
   if (!parts.length || parts.length > 100 || parts.some(p => !/^#?[1-9]\d*$/.test(p))) return null;
   const ids = [...new Set(parts.map(p => Number(p.replace(/^#/, ""))))];
   if (ids.some(id => !Number.isSafeInteger(id)) || (action === "show" && ids.length !== 1)) return null;
@@ -86,7 +100,38 @@ export function validateBridge(value: unknown): BridgeSnapshot {
     }
     ids.add(task.id);
   }
+  if (data.information !== undefined) {
+    if (!Array.isArray(data.information)) throw new Error("Invalid informational emails");
+    const informationIds = new Set<number>();
+    for (const item of data.information) {
+      if (!item || !Number.isSafeInteger(item.id) || item.id < 1 || informationIds.has(item.id)
+        || [item.summary, item.subject, item.sender_name, item.sender_address].some(v => typeof v !== "string")
+        || !item.summary.trim() || item.summary.length > 1000
+        || typeof item.received_at !== "string" || !/(Z|[+-]\d{2}:\d{2})$/.test(item.received_at)
+        || Number.isNaN(Date.parse(item.received_at)) || ![true, false, null].includes(item.is_read)
+        || (item.preview !== undefined && (typeof item.preview !== "string" || item.preview.length > 12000))) {
+        throw new Error("Invalid informational email");
+      }
+      informationIds.add(item.id);
+    }
+  }
   return data;
+}
+
+export function informationalEmails(data: BridgeSnapshot, now: Date, frozen = false): InformationEmail[] {
+  return (data.information ?? []).filter(item => item.is_read === false
+    && (frozen || (Date.parse(item.received_at) > now.getTime() - 72 * 3600000 && Date.parse(item.received_at) <= now.getTime())))
+    .sort((a, b) => Date.parse(b.received_at) - Date.parse(a.received_at) || a.id - b.id);
+}
+
+export function informationParts(item: InformationEmail): string[] {
+  const reference = `<code>#i${item.id}</code>`;
+  return [
+    ...textChunks(item.subject, 1800).map(value => `ℹ️ ${reference} <b>${value}</b>`),
+    ...textChunks(item.sender_name || item.sender_address, 1800).map(value => `<i>${value}</i>`),
+    ...textChunks(item.summary, 1800),
+    `<code>/show #i${item.id}</code> · <code>/read #i${item.id}</code>`,
+  ];
 }
 
 // Escape after splitting: long bodies cannot split an HTML entity or tag.
@@ -198,7 +243,7 @@ export function digestTaskGroups(data: BridgeSnapshot, now = new Date(), fixedGr
   return groups;
 }
 
-export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>()): string[] {
+export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>(), frozenInformation = false): string[] {
   const today = singaporeClock(now).date;
   const groups = digestTaskGroups(data, now, fixedGroups);
   const emojis = ["🔴", "🟠", "🟡", "⚪", "💤"];
@@ -228,8 +273,13 @@ export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups
       compact = [];
     } else compact.push(...parts);
   }
-  const pages = [...messages, ...packDigestBlocks(compact)];
-  return pages.length === 1 ? [...pages, "No active tasks."] : pages;
+  const information = informationalEmails(data, now, frozenInformation);
+  const infoTitle = "ℹ️ <b>INFORMATIONAL EMAILS · LAST 72 HOURS</b>";
+  const infoPages = packDigestBlocks(information.flatMap(informationParts), 2800);
+  const pages = [...messages, ...packDigestBlocks(compact),
+    ...(infoPages.length ? infoPages.map(page => `${infoTitle}\n\n${page}`) : [
+      `${groups.every(([, tasks]) => tasks.every(task => !["open", "waiting"].includes(task.status))) ? "No active tasks.\n\n" : ""}${infoTitle}\n\nNo unread informational emails.`])];
+  return pages;
 }
 
 async function flush(env: Env, now = new Date()): Promise<void> {
@@ -294,15 +344,15 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     const data = await snapshot(env);
     if (data?.processed_telegram_updates?.includes(update.update_id!)) return Response.json({ ok: true });
     const ids = cmd?.ids ?? [];
-    const missing = ids.filter(id => !data?.tasks.some(t => t.id === id));
-    const quiet = Boolean(cmd && data && !missing.length && ["read", "done", "dismiss", "waiting", "reopen"].includes(cmd.action));
+    const missing = ids.filter(id => !(cmd?.information ? data?.information : data?.tasks)?.some(t => t.id === id));
+    const quiet = Boolean(cmd && !cmd.information && data && !missing.length && ["read", "done", "dismiss", "waiting", "reopen"].includes(cmd.action));
     if (quiet) await ensureDigestLayouts(env, data!);
     let chunks: string[];
     let pending = false;
-    if (!cmd) chunks = ["Unknown command or invalid arguments. Use /help."];
+    if (!cmd) chunks = ["Unknown command or invalid arguments. Send task and informational IDs in separate commands. Use /help."];
     else if (cmd.action === "help") chunks = [help];
     else if (!data) chunks = ["No bridge snapshot yet. Run outlook-triage bridge-poll on Windows to initialize cloud state."];
-    else if (missing.length) chunks = textChunks(`Tasks not found: ${missing.map(id => `#${id}`).join(", ")}. No changes made.`);
+    else if (missing.length) chunks = textChunks(`${cmd.information ? "Informational emails" : "Tasks"} not found: ${missing.map(id => `#${cmd.information ? "i" : ""}${id}`).join(", ")}. No changes made.`);
     else if (cmd.action === "status") {
       const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM cloud_events WHERE status='pending'").first<{ count: number }>();
       const bridge = await env.DB.prepare("SELECT last_seen FROM cloud_snapshot WHERE singleton=1").first<{ last_seen: string }>();
@@ -312,7 +362,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       const tasks = data.tasks.filter(t => cmd.option === "all" || t.status === cmd.option);
       chunks = textChunks(`Tasks · ${cmd.option}\n${tasks.map(t => `#${t.id} [${t.status}] [${t.urgency}] ${t.description}${t.deadline ? ` — due ${t.deadline}` : ""}`).join("\n\n") || "No matching tasks."}`);
     } else if (cmd.action === "show") {
-      const task = data.tasks.find(t => t.id === ids[0])!;
+      const task = (cmd.information ? data.information : data.tasks)!.find(t => t.id === ids[0])!;
       chunks = task.preview === undefined ? ["No cached body preview. Enable bridge preview caching on Windows and reconnect."]
         : textChunks(`Email preview · ${task.subject}\nCached at the last bridge publication; bounded preview.\n\n${task.preview || "(empty body)"}`);
     } else if (["waiting", "reopen"].includes(cmd.action)) {
@@ -322,7 +372,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       chunks = [`⏳ /${cmd.action} queued. It will complete when the Windows Outlook bridge connects.`];
     }
     const event = env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,task_ids,retry_limit,status,created_at) VALUES(?,?,?,?,?,?)")
-      .bind(key, missing.length ? "invalid" : cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
+      .bind(key, missing.length ? "invalid" : cmd?.information && cmd.action === "read" ? "read_information" : cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
     const statements = [event];
     if (cmd && data && !missing.length && ["waiting", "reopen"].includes(cmd.action)) {
       for (const id of ids) statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=(SELECT id FROM cloud_events WHERE dedupe_key=?) WHERE id=?")
@@ -387,10 +437,10 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
     const completed: number[] = JSON.parse(event.completed_ids);
     const statements: D1PreparedStatement[] = [];
     if (body.task_id !== undefined) {
-      if (!ids.includes(body.task_id) || !["read", "done", "dismiss"].includes(event.action)) return Response.json({ error: "Task not in command" }, { status: 400 });
+      if (!ids.includes(body.task_id) || !["read", "done", "dismiss", "read_information"].includes(event.action)) return Response.json({ error: "Item not in command" }, { status: 400 });
       if (completed.includes(body.task_id) && !body.failed) { await flush(env); return Response.json({ ok: true }); }
       if (!completed.includes(body.task_id)) completed.push(body.task_id);
-      if (event.action !== "read") statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=? WHERE id=? AND revision<=?")
+      if (["done", "dismiss"].includes(event.action)) statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=? WHERE id=? AND revision<=?")
         .bind(event.action === "done" ? "done" : "dismissed", event.id, body.task_id, event.id));
       statements.push(env.DB.prepare("UPDATE cloud_events SET completed_ids=? WHERE id=?").bind(JSON.stringify(completed), event.id));
     }
@@ -401,6 +451,9 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
       let message = body.failed
         ? `/${event.action} failed on the bridge. ${completed.length}/${ids.length} mailbox items completed; earlier successes were kept. Check Windows logs and resend to retry.`
         : `✅ /${event.action} completed on the Outlook bridge.${ids.length ? ` Emails marked read: ${ids.map(id => `#${id}`).join(", ")}. Later cloud task changes take precedence.` : ""}`;
+      if (event.action === "read_information") message = body.failed
+        ? `Informational read failed: ${completed.length}/${ids.length} completed. Earlier successes were kept; resend to retry.`
+        : `✅ Informational emails marked read: ${ids.map(id => `#i${id}`).join(", ")}.`;
       if (body.counts) {
         const counts = body.counts;
         message += `\n${["processed", "skipped", "failed", "unchanged"].map(k => `${k}=${Number.isSafeInteger(counts[k]) ? counts[k] : 0}`).join(" ")}`;

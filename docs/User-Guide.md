@@ -401,3 +401,25 @@ outlook-triage --verbose sync
 ```
 
 Do not post `secrets.env`, the SQLite database, reports, or verbose output containing organizational details in public support channels.
+## Informational email summaries
+
+The inbox brief includes **Informational emails · last 72 hours**, immediately after
+Waiting / follow-up. Each entry contains the sender, subject, saved SoCLaaS summary,
+and an informational reference such as `#i42`. Only unread emails classified as
+information with no required action appear; newsletters, automated emails, and
+explicitly ignored messages remain excluded. Existing Last 24 hours statistics
+keep their original window.
+
+- `/show #i42` displays a bounded preview of the original email without marking it read.
+- `/read #i42` marks the original email read in Outlook and removes it from future briefs after confirmation.
+- `/read #i42 #i43` processes multiple informational emails. Send task references such as `#42` in a separate command.
+
+Reading an email directly in Outlook removes it after the next successful read-state
+synchronization. Entries expire 72 hours after receipt. Unknown read states remain
+hidden until checked; a failed refresh retains the last confirmed state and shows
+a synchronization warning. Existing task commands and task counts are unchanged.
+
+Cloud read commands wait for the Windows bridge. Cloud `/show` requires the bridge's
+existing `--cache-previews` option; previews are bounded and encrypted. Summaries
+are reused from classification without another SoCLaaS request. Informational
+summaries are included in the configured Telegram destination.

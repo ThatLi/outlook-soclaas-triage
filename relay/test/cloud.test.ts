@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { type Env } from "../src/index";
-import { parseCloudCommand, renderDigest, runCloudScheduled, textChunks, type BridgeSnapshot } from "../src/cloud";
+import { parseCloudCommand, renderDigest, runCloudScheduled, textChunks, validateBridge, type BridgeSnapshot } from "../src/cloud";
 import { digestMessage, type DigestRow } from "../src/interactive-digest";
 import { unseal } from "../src/cloud";
 import { digestGroups } from "../src/task-feedback";
@@ -163,6 +163,78 @@ beforeEach(async () => {
   expect((await publish()).status).toBe(200);
 });
 afterEach(() => { database.db.close(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe("informational emails", () => {
+  function withInformation(): BridgeSnapshot {
+    return { ...fixture(), information: [{ id: 1, subject: "<FYI>", summary: "Saved <summary> & detail",
+      sender_name: "Sender", sender_address: "sender@test", received_at: new Date().toISOString(), is_read: false,
+      preview: "Original <body>" }] };
+  }
+  it("keeps informational command IDs separate and rejects mixed or mutating commands", () => {
+    expect(parseCloudCommand("/read@bot #i1 I2 #i1")).toMatchObject({ ids: [1, 2], information: true });
+    expect(parseCloudCommand("/show i1")).toMatchObject({ ids: [1], information: true });
+    for (const text of ["/read #i1 #1", "/done #i1", "/waiting #i1", "/show i1 i2", "/read i0", "/read i9007199254740992"]) {
+      expect(parseCloudCommand(text)).toBeNull();
+    }
+  });
+  it("validates optional collections and rejects malformed informational data", () => {
+    expect(validateBridge(fixture()).information).toBeUndefined();
+    for (const change of [{ id: 0 }, { is_read: 0 }, { received_at: "invalid" }, { preview: "x".repeat(12001) }, { summary: "" }]) {
+      const data = withInformation(); Object.assign(data.information![0], change);
+      expect(() => validateBridge(data)).toThrow();
+    }
+    const data = withInformation(); data.information!.push(data.information![0]);
+    expect(() => validateBridge(data)).toThrow();
+  });
+  it("uses a strict 72-hour window and renders escaped summaries after waiting", () => {
+    const data = withInformation();
+    for (const [id, hours, read] of [[2, 72, false], [3, 71, true], [4, -1, false], [5, 71, false]] as const) {
+      data.information!.push({ ...data.information![0], id, received_at: new Date(Date.now() - hours * 3600000).toISOString(), is_read: read });
+    }
+    const plain = renderDigest(data).join("\n"), rich = renderRichDigest(data).join("\n");
+    for (const rendered of [plain, rich]) {
+      expect(rendered.indexOf("INFORMATIONAL EMAILS")).toBeGreaterThan(rendered.indexOf("WAITING / FOLLOW-UP"));
+      expect(rendered).toContain("Saved &lt;summary&gt; &amp; detail");
+      expect(rendered).toContain("/show #i1"); expect(rendered).toContain("/read #i5");
+      for (const id of [2, 3, 4]) expect(rendered).not.toContain(`/show #i${id}`);
+    }
+  });
+  it("queues reads until bridge confirmation and never changes matching task IDs", async () => {
+    const data = withInformation(); await publish(data);
+    await command("/show #i1"); expect(sent.join("\n")).toContain("Original &lt;body&gt;");
+    await command("/read #i1");
+    const job = (await poll()).job!;
+    expect(database.db.prepare("SELECT action FROM cloud_events WHERE id=?").get(job.id)!.action).toBe("read_information");
+    expect(job.task_ids).toEqual([1]);
+    expect(renderDigest(data).join("\n")).toContain("/read #i1");
+    data.information![0].is_read = true; await publish(data);
+    await ack({ event_id: job.id, task_id: 1 });
+    expect(state(1)!.status).toBe("open");
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_task_feedback WHERE event_id=?").get(job.id)!.count).toBe(0);
+    expect(sent.join("\n")).toContain("#i1");
+    expect(renderDigest(data).join("\n")).not.toContain("/read #i1");
+  });
+  it("freezes edition membership and summaries while removing confirmed reads", async () => {
+    const data = withInformation(); await publish(data); await command("/list");
+    const row = digestRows()[0];
+    const layout = JSON.parse((await unseal(env, row.id, row.sealed_layout!))[0]);
+    expect(layout.information[0].preview).toBeUndefined();
+    expect(layout.information[0].summary).toBe("Saved <summary> & detail");
+    data.information![0].summary = "Changed summary";
+    data.information!.push({ ...data.information![0], id: 2, summary: "New arrival" });
+    await publish(data);
+    let html = (await storedPages(digestRows()[0])).join("\n");
+    expect(html).toContain("Saved &lt;summary&gt;"); expect(html).not.toContain("Changed summary"); expect(html).not.toContain("New arrival");
+    data.information![0].is_read = true; await publish(data);
+    html = (await storedPages(digestRows()[0])).join("\n");
+    expect(html).not.toContain("/show #i1");
+    data.information = data.information!.filter(item => item.id !== 1); await publish(data);
+    expect((await storedPages(digestRows()[0])).join("\n")).not.toContain("/show #i1");
+    await command("/list");
+    const fresh = digestRows().find(digest => digest.id !== row.id)!;
+    expect((await storedPages(fresh)).join("\n")).toContain("New arrival");
+  });
+});
 
 describe("temporary /list acknowledgement messages", () => {
   function replies(event: number) {
@@ -606,10 +678,10 @@ describe("interactive digests", () => {
     expect((await storedPages(digestRows()[0])).join("\n")).toContain("☒ <code>#1</code>");
     data.tasks[0].description = "Short action";
     await publish(data);
-    expect(digestRows()[0].view).toBe("outlook"); expect(digestRows()[0].page).toBe(0);
+    expect(digestRows()[0].view).toBe("outlook"); expect(digestRows()[0].page).toBe(1);
     const edit = telegramCalls.filter(c => c.method === "editMessageText").at(-1)!;
-    expect(edit.body.text).toContain("Daily brief — 2026-11-01 (Page 1 / 1)</b>");
-    expect(JSON.stringify(edit.body.reply_markup)).not.toMatch(/Previous|Next/);
+    expect(edit.body.text).toContain("Daily brief — 2026-11-01 (Page 2 / 2)</b>");
+    expect(JSON.stringify(edit.body.reply_markup)).not.toMatch(/Next/);
   });
   it("retries refresh failures and respects Telegram retry delays without losing mutations", async () => {
     await command("/list");
@@ -795,7 +867,7 @@ describe("rich digests", () => {
     const rendered = renderRichDigest(data, new Date(), undefined, new Map(), "✅ Completed: /done · 1/1 confirmed");
     expect(rendered).toHaveLength(1);
     const html = rendered[0];
-    expect(html.match(/<details>/g)).toHaveLength(6);
+    expect(html.match(/<details>/g)).toHaveLength(7);
     expect(html).not.toMatch(/<details\s+open|callback_data|inline_keyboard/);
     for (const id of [1, 2, 3, 4, 5]) expect(html).toContain(`<code>#${id}</code>`);
     expect(html).toContain("OVERDUE · 1"); expect(html).toContain("WAITING / FOLLOW-UP · 1");
@@ -811,7 +883,7 @@ describe("rich digests", () => {
     const data = fixture(); data.tasks = [];
     const html = renderRichDigest(data, new Date(), undefined, new Map(), "", "Trial news")[0];
     expect(html).toContain("No active tasks."); expect(html).toContain("OVERDUE · 0");
-    expect(html.match(/<details>/g)).toHaveLength(2);
+    expect(html.match(/<details>/g)).toHaveLength(3);
     expect(html).toContain("<details><summary>📰 News</summary><p>Trial news</p></details>");
   });
   it("keeps Unicode and long fragments complete under the byte and block budgets", () => {
@@ -1004,7 +1076,8 @@ describe("command and rendering contracts", () => {
   });
   it("separates immediate urgency sections and combines only the two lower-priority sections", () => {
     const pages = renderDigest(allSectionsFixture());
-    expect(pages).toHaveLength(5);
+    expect(pages).toHaveLength(6);
+    expect(pages[5]).toContain("INFORMATIONAL EMAILS · LAST 72 HOURS");
     expect(pages[0]).toContain("OPEN ACTIONS");
     expect(pages[1]).toContain("<b>OVERDUE · 1</b>");
     expect(pages[2]).toContain("<b>URGENT / DUE TODAY · 1</b>");
@@ -1022,7 +1095,7 @@ describe("command and rendering contracts", () => {
     const data = allSectionsFixture(); data.tasks = data.tasks.slice(3);
     data.tasks.forEach(task => { task.description = "Long action ".repeat(180); });
     const pages = renderDigest(data);
-    expect(pages).toHaveLength(3);
+    expect(pages).toHaveLength(4);
     expect(pages[1]).toContain("OTHER OPEN ACTIONS"); expect(pages[1]).not.toContain("WAITING / FOLLOW-UP");
     expect(pages[2]).toContain("WAITING / FOLLOW-UP"); expect(pages[2]).not.toContain("OTHER OPEN ACTIONS");
   });
@@ -1045,7 +1118,7 @@ describe("command and rendering contracts", () => {
     if (large !== "waiting") data.tasks[0].description = "<long other & action> 😀".repeat(400);
     if (large !== "other") data.tasks[1].description = "<long waiting & action> 😀".repeat(400);
     const pages = renderDigest(data);
-    for (const page of pages.slice(1)) {
+    for (const page of pages.slice(1, -1)) {
       expect([...page.matchAll(/^[🔴🟠🟡⚪💤]+ <b>/gmu)]).toHaveLength(1);
       if (page.includes(large === "waiting" ? "WAITING / FOLLOW-UP" : "OTHER OPEN ACTIONS")) expect(page).toContain("— PART ");
     }
@@ -1059,7 +1132,7 @@ describe("command and rendering contracts", () => {
     data.tasks[0].status = "done"; data.tasks[1].status = "dismissed"; data.tasks[3].status = "waiting";
     const notes = new Map([[3, " <i>· ⏳ Done pending</i>"], [4, " <i>· 💤 Waiting</i>"]]);
     const pages = renderDigest(data, new Date(), groups, notes);
-    expect(pages).toHaveLength(5);
+    expect(pages).toHaveLength(6);
     expect(pages[1]).toContain("OVERDUE · 0 remaining / 1"); expect(pages[1]).toContain("☑ <code>#1</code>");
     expect(pages[2]).toContain("URGENT / DUE TODAY · 0 remaining / 1"); expect(pages[2]).toContain("☒ <code>#2</code>");
     expect(pages[3]).toContain("Done pending</i>");
@@ -1068,11 +1141,11 @@ describe("command and rendering contracts", () => {
   it("omits empty sections without filling another urgency page with lower-priority tasks", () => {
     const data = allSectionsFixture(); data.tasks = data.tasks.filter(task => [3, 5].includes(task.id));
     const pages = renderDigest(data);
-    expect(pages).toHaveLength(3);
+    expect(pages).toHaveLength(4);
     expect(pages[1]).toContain("DUE WITHIN 7 DAYS"); expect(pages[1]).not.toContain("WAITING / FOLLOW-UP");
     expect(pages[2]).toContain("WAITING / FOLLOW-UP");
     data.tasks = [];
-    expect(renderDigest(data)[1]).toBe("No active tasks.");
+    expect(renderDigest(data)[1]).toContain("No active tasks.");
   });
   it("hides Outlook navigation at the edges and keeps every rendered view within budget", () => {
     const data = fixture(); data.tasks[0].description = "<>&😀".repeat(3000);

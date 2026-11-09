@@ -71,7 +71,7 @@ def _canonical_metadata(envelope: dict[str, Any]) -> bytes:
 def build_payload(db: Database, settings: Settings, now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
     delivery = next_delivery(now, settings)
     status = db.operational_status()
-    digest_chunks = format_digest(build_digest(db, settings, delivery))
+    digest_chunks = format_digest(build_digest(db, settings, delivery, information_as_of=now))
     task_views: dict[str, list[str]] = {}
     for name in ("all", "open", "waiting", "done", "dismissed"):
         rows = db.list_tasks(None if name == "all" else name)

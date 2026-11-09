@@ -72,6 +72,67 @@ def test_sync_receipt_survives_lost_cloud_ack(bridge):
     assert client.acks == [(1, {"counts": {"processed": 2, "failed": 0}})]
 
 
+def test_information_read_publishes_before_ack_and_reuses_receipt(bridge):
+    from test_information import add_information
+    db, config, client = bridge
+    add_information(db, datetime.now(config.timezone))
+    reads = []
+    class Outlook:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def mark_read(self, source, store): reads.append(source)
+    original_ack = client.acknowledge
+    def acknowledge(*args, **kwargs):
+        payload = decrypt_payload(client.envelopes[-1], TEST_ENCRYPTION_KEY)
+        assert payload["bridge"]["information"][0]["is_read"] is True
+        original_ack(*args, **kwargs)
+    client.acknowledge = acknowledge
+    client.fail_ack_once = True
+    job = {"id": 70, "action": "read_information", "task_ids": [1], "completed_ids": []}
+    with pytest.raises(RelayError):
+        process_job(db, config, client, job, logging.getLogger(), outlook_factory=Outlook)
+    process_job(db, config, client, job, logging.getLogger(), outlook_factory=Outlook)
+    assert reads == ["info"]
+    assert client.acks == [(70, {"task_id": 1})]
+    assert db.task_email(1)["task_status"] == "open"
+
+
+def test_information_read_partial_failure_keeps_successes(bridge):
+    from test_information import add_information
+    db, config, client = bridge
+    add_information(db, datetime.now(config.timezone))
+    add_information(db, datetime.now(config.timezone), "missing")
+    class Outlook:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def mark_read(self, source, store):
+            if source == "missing": raise OutlookError("missing")
+    job = {"id": 71, "action": "read_information", "task_ids": [1, 2], "completed_ids": []}
+    process_job(db, config, client, job, logging.getLogger(), outlook_factory=Outlook)
+    assert client.acks == [(71, {"task_id": 1}), (71, {"failed": True})]
+    assert db.information_email(1)["is_read"] == 1
+    assert db.information_email(2)["is_read"] == 0
+
+
+def test_information_previews_are_encrypted_bounded_and_opt_in(bridge):
+    from test_information import add_information
+    db, config, client = bridge
+    add_information(db, datetime.now(config.timezone))
+    class Outlook:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get_body_preview(self, source, store, *, limit): return ("body" * 4000)[:limit]
+    publish_bridge(db, config, client)
+    assert "preview" not in decrypt_payload(client.envelopes[-1], TEST_ENCRYPTION_KEY)["bridge"]["information"][0]
+    publish_bridge(db, config, client, cache_previews=True, outlook_factory=Outlook)
+    item = decrypt_payload(client.envelopes[-1], TEST_ENCRYPTION_KEY)["bridge"]["information"][0]
+    assert len(item["preview"]) == config.telegram_body_preview_chars
+    assert "preview" not in client.envelopes[-1]
+
+
 def test_read_receipt_survives_lost_ack_without_mutating_local_status(bridge):
     db, config, client = bridge
     reads = []

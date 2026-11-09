@@ -188,6 +188,17 @@ def test_body_preview_is_bounded_and_does_not_change_read_state():
     assert item.save_calls == 0
 
 
+def test_read_status_is_metadata_only():
+    item = Item("entry-1", datetime(2026, 10, 2, 8, 0, tzinfo=SGT), unread=True)
+    client, _, _ = make_client([item])
+    with client:
+        assert client.is_read("entry-1", "store-1") is False
+        item.UnRead = False
+        assert client.is_read("entry-1", "store-1") is True
+    assert item.body_reads == 0
+    assert item.save_calls == 0
+
+
 def test_exchange_sender_and_refetch():
     item = Item("entry-1", datetime(2026, 10, 2, 8, 0, tzinfo=SGT), sender_type="EX")
     client, _, _ = make_client([item])

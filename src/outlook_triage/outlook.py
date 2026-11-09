@@ -153,6 +153,7 @@ class OutlookClient:
             "sender": {"emailAddress": {"name": name, "address": address}},
             "subject": str(_safe_get(item, "Subject", "") or "(no subject)"),
             "receivedDateTime": received.isoformat(timespec="seconds"),
+            "isRead": not bool(item.UnRead),
             "importance": importance,
             "bodyPreview": body[:255],
             "body": {"contentType": "text", "content": body},
@@ -215,6 +216,14 @@ class OutlookClient:
             raise
         except Exception as exc:
             raise self._translate_error("mark the selected Outlook message as read", exc) from exc
+
+    def is_read(self, source_id: str, store_id: str | None = None) -> bool:
+        """Read only the selected item's read status, without accessing its body."""
+        try:
+            item = self.namespace.GetItemFromID(source_id, store_id or self.store_id)
+            return not bool(item.UnRead)
+        except Exception as exc:
+            raise self._translate_error("read the selected Outlook message status", exc) from exc
 
     def get_body_preview(self, source_id: str, store_id: str | None = None, *, limit: int = 6000) -> str:
         """Read a bounded plain-text body without changing the item's read state."""

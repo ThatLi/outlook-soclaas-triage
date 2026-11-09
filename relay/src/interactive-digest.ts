@@ -1,9 +1,9 @@
 import type { Env } from "./index";
-import { digestTaskGroups, renderDigest, seal, snapshot, unseal } from "./cloud";
+import { digestTaskGroups, renderDigest, seal, snapshot, unseal, informationalEmails } from "./cloud";
 import { singaporeClock } from "./index";
 import { TelegramFailure, telegramRequest } from "./telegram-api";
 import { annotation, digestGroups, effectiveStates, feedbackLabel, type DigestGroup, type TaskEvent } from "./task-feedback";
-import type { BridgeSnapshot, CloudTask } from "./cloud";
+import type { BridgeSnapshot, CloudTask, InformationEmail } from "./cloud";
 import { fetchNews } from "./news";
 import { renderRichDigest } from "./rich-digest";
 
@@ -15,7 +15,7 @@ export interface DigestRow {
   sealed_news?: string | null;
   format: "legacy" | "rich";
 }
-interface DigestLayout { tasks: CloudTask[]; groups: DigestGroup[] }
+interface DigestLayout { tasks: CloudTask[]; groups: DigestGroup[]; information?: InformationEmail[] }
 export interface DigestCallback {
   id?: string; data?: string; from?: { id?: number; is_bot?: boolean };
   message?: { message_id?: number; chat?: { id?: number; type?: string } };
@@ -45,7 +45,8 @@ export async function queueDigest(env: Env, now = new Date()) {
   const data = await snapshot(env);
   const groups = data ? digestTaskGroups(data, now).map(([heading, tasks]) => ({ heading, ids: tasks.map(task => task.id) })) : [];
   const ids = groups.flatMap(group => group.ids);
-  const layout: DigestLayout | null = data ? { tasks: data.tasks.filter(task => ids.includes(task.id)).map(({ preview, ...task }) => task), groups } : null;
+  const layout: DigestLayout | null = data ? { tasks: data.tasks.filter(task => ids.includes(task.id)).map(({ preview, ...task }) => task), groups,
+    information: informationalEmails(data, now).map(({ preview, ...item }) => item) } : null;
   let news: string | null = null;
   if (env.NEWS_TRIAL_ENABLED === "true") {
     const saved = await env.DB.prepare("SELECT id,sealed_news FROM interactive_digests WHERE digest_date=? AND sealed_news IS NOT NULL ORDER BY rowid LIMIT 1")
@@ -102,9 +103,16 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
       const { tasks, events } = await effectiveStates(env);
       const notes = new Map(layout.tasks.map(task => [task.id, annotation(task.id, tasks.get(task.id), events)]));
       const updated = layout.tasks.map(task => ({ ...task, ...latest.get(task.id), status: (tasks.get(task.id)?.status ?? task.status) as CloudTask["status"] }));
+      const latestInformation = new Map((data.information ?? []).map(item => [item.id, item]));
+      const information = (layout.information ?? []).map(item => ({ ...item,
+        is_read: latestInformation.get(item.id)?.is_read ?? item.is_read }));
+      if (information.some((item, index) => item.is_read !== layout.information![index].is_read)) {
+        await env.DB.prepare("UPDATE interactive_digests SET sealed_layout=? WHERE id=?")
+          .bind(await seal(env, row.id, [JSON.stringify({ ...layout, information })]), row.id).run();
+      }
       if (row.format === "rich") {
-        richData = { ...data, tasks: updated }; richGroups = layout.groups; richNotes = notes;
-      } else pages = renderDigest({ ...data, tasks: updated }, now, layout.groups, notes);
+        richData = { ...data, tasks: updated, information }; richGroups = layout.groups; richNotes = notes;
+      } else pages = renderDigest({ ...data, tasks: updated, information }, now, layout.groups, notes, true);
     }
   }
   const event = row.feedback_event === null || row.digest_date !== singaporeClock(now).date ? null
@@ -113,7 +121,7 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
   const news = row.sealed_news ? (await unseal(env, row.id, row.sealed_news))[0] : undefined;
   if (row.format === "rich") {
     // Older editions retry their encrypted, frozen rendering instead of using today's snapshot.
-    if (richData) pages = renderRichDigest(richData, new Date(`${row.digest_date}T00:00:00+08:00`), richGroups, richNotes, feedback, news);
+    if (richData) pages = renderRichDigest(richData, new Date(`${row.digest_date}T00:00:00+08:00`), richGroups, richNotes, feedback, news, true);
     await env.DB.prepare("UPDATE interactive_digests SET sealed_pages=?,feedback_text=? WHERE id=?")
       .bind(await seal(env, row.id, pages), feedback, row.id).run();
     return deliverRichDigest(env, row, pages);
