@@ -29,6 +29,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    for name, help_text in (("setup", "Guided connection setup; no mailbox processing"),
+                            ("doctor", "Read-only connection and background checks"),
+                            ("verify", "Separate fictional first-run test and optional background operation")):
+        guided = commands.add_parser(name, help=help_text)
+        guided.add_argument("--pause", action="store_true", help="Keep shortcut-launched results visible")
+    background = commands.add_parser("background", help="Manage only this installation's scheduled tasks")
+    background.add_argument("action", choices=["plan", "status", "enable", "stop"])
+    background.add_argument("--project-dir")
+    background.add_argument("--task-prefix")
+    background.add_argument("--cloud", action="store_true")
+    background.add_argument("--telegram", action="store_true")
+    background.add_argument("--listener", action="store_true")
+    background.add_argument("--cache-previews", action="store_true")
+    background.add_argument("--pause", action="store_true")
+
     commands.add_parser("init", help="Create configuration templates and runtime directories")
     commands.add_parser("models", help="List SoCLaaS models available to this API key")
 
@@ -149,6 +164,19 @@ def _run_tasks(args, db: Database) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    # Guided checks must bypass normal log creation and Database initialization.
+    if args.command == "setup":
+        from .onboarding import setup
+        return setup()
+    if args.command == "doctor":
+        from .diagnostics import doctor
+        return doctor(interactive=getattr(args, "pause", False))
+    if args.command == "verify":
+        from .onboarding import verify
+        return verify()
+    if args.command == "background":
+        from .scheduler import script_main
+        return script_main(args)
     settings = load_settings()
     ensure_runtime_directories(settings)
     logger = configure_logging(settings.log_file, args.verbose)
@@ -414,4 +442,13 @@ def main() -> int:
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
+    except Exception:
+        print("The command could not finish. Open Outlook Triage - Troubleshooting for recovery instructions.", file=sys.stderr)
+        return 1
+    finally:
+        if getattr(args, "pause", False):
+            try:
+                input("\nResults remain visible. Press Enter to close this window: ")
+            except (EOFError, KeyboardInterrupt):
+                pass
 

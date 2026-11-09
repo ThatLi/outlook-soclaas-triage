@@ -1,0 +1,47 @@
+name: Windows release installer
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14.2'
+          architecture: x64
+      - name: Verify tag and run tests
+        shell: pwsh
+        run: |
+          python -m pip install -e '.[dev]'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m pytest --basetemp="$env:RUNNER_TEMP/release-tests" -p no:cacheprovider
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = python -c 'from outlook_triage import __version__; print(__version__)'
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Release tag must match the package version.' }
+      - name: Install pinned installer compiler
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $download
+          if ((Get-FileHash $download -Algorithm SHA256).Hash -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') { throw 'Compiler checksum mismatch.' }
+          $compilerDir = Join-Path $env:RUNNER_TEMP 'inno'
+          $options = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', ('/DIR="' + $compilerDir + '"'))
+          $process = Start-Process $download -ArgumentList $options -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode) { throw 'Compiler installation failed.' }
+          'INNO_COMPILER=' + (Join-Path $compilerDir 'ISCC.exe') | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build isolated bundle and installer
+        shell: pwsh
+        run: ./scripts/build_release.ps1 -ISCC "$env:INNO_COMPILER"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Outlook-SoCLaaS-Triage-windows-x64-installer
+          path: |
+            dist/*-setup.exe
+            dist/*-setup.exe.sha256
+          if-no-files-found: error

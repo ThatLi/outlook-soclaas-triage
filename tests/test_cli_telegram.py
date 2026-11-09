@@ -99,22 +99,25 @@ def test_sync_reports_pending_relay_without_changing_classification_exit(monkeyp
 def test_scheduler_supports_opt_in_telegram_action():
     script = (cli.Path(__file__).parents[1] / "scripts" / "register_windows_tasks.ps1").read_text(encoding="utf-8")
     assert "[switch]$EnableTelegram" in script
-    assert '"digest --telegram"' in script
+    assert "'--telegram'" in script
     assert "[switch]$EnableTelegramCommands" in script
-    assert '"telegram-listen"' in script
+    assert "'--listener'" in script
+    from outlook_triage.scheduler import task_plan
+    assert [t["arguments"] for t in task_plan(telegram=True, listener=True)["tasks"]][-2:] == [
+        "-m outlook_triage digest --telegram", "-m outlook_triage telegram-listen"]
 
 
 def test_scheduler_resolves_default_project_dir_inside_script_body():
     script = (cli.Path(__file__).parents[1] / "scripts" / "register_windows_tasks.ps1").read_text(encoding="utf-8")
     assert "[string]$ProjectDir =" not in script
-    assert "$scriptPath = $PSCommandPath" in script
-    assert "$scriptPath = $MyInvocation.MyCommand.Path" in script
+    helper = (cli.Path(__file__).parents[1] / "scripts" / "invoke_scheduler.ps1").read_text(encoding="utf-8")
+    assert "Split-Path -Parent $PSScriptRoot" in helper
 
 
 def test_documentation_discloses_show_privacy_and_read_mutation():
     root = cli.Path(__file__).parents[1]
-    readme = (root / "README.md").read_text(encoding="utf-8")
-    guide = (root / "docs" / "User-Guide.md").read_text(encoding="utf-8")
+    readme = (root / "docs" / "Source-Installation.md").read_text(encoding="utf-8")
+    guide = (root / "docs" / "Advanced-CLI.md").read_text(encoding="utf-8")
     assert "authorized `/read`, `/done`, or `/dismiss`" in readme
     assert "`/waiting` and `/reopen` change local workflow state only" in readme
     assert "`/list` always means synchronize first" in guide
@@ -126,3 +129,6 @@ def test_documentation_discloses_show_privacy_and_read_mutation():
     assert "`/dismiss #42`" in guide
     assert "TELEGRAM_BODY_PREVIEW_CHARS" in guide
     assert "does not store raw command text, email bodies, or Outlook identifiers" in guide
+    beginner = (root / "docs" / "User-Guide.md").read_text(encoding="utf-8")
+    assert "**do mark the original emails read**" in beginner
+    assert "bounded original email body preview" in beginner

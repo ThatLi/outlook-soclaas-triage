@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -107,7 +109,7 @@ def load_settings() -> Settings:
     state_dir = _configured_path("OUTLOOK_TRIAGE_STATE_DIR", data_dir / "state")
     secrets_file = Path(os.environ.get("OUTLOOK_TRIAGE_SECRETS_FILE", config_dir / "secrets.env")).expanduser()
 
-    file_values = dotenv_values(secrets_file) if secrets_file.exists() else {}
+    file_values = dotenv_values(secrets_file, interpolate=False) if secrets_file.exists() else {}
 
     def value(name: str, default: str | None = None) -> str | None:
         result = os.environ.get(name, file_values.get(name, default))
@@ -155,4 +157,40 @@ def load_settings() -> Settings:
 def ensure_runtime_directories(settings: Settings) -> None:
     for path in (settings.config_dir, settings.data_dir, settings.state_dir, settings.reports_dir):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def save_settings(path: Path, changes: dict[str, str]) -> None:
+    """Replace only requested keys; atomically retain all other settings/comments."""
+    if any(not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or any(c in value for c in "\r\n\0")
+           for key, value in changes.items()):
+        raise ConfigurationError("Settings must contain single-line values.")
+    original = path.read_text(encoding="utf-8") if path.exists() else ""
+    remaining = dict(changes)
+    lines = []
+    for line in original.splitlines():
+        match = re.match(r"\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=", line)
+        if match and match[1] in changes:
+            if match[1] not in remaining:
+                continue
+            value = remaining.pop(match[1]).replace("\\", "\\\\").replace("'", "\\'")
+            lines.append(f"{match[1]}='{value}'")
+        else:
+            lines.append(line)
+    for key, value in remaining.items():
+        value = value.replace("\\", "\\\\").replace("'", "\\'")
+        lines.append(f"{key}='{value}'")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".settings-", delete=False) as stream:
+            name = stream.name
+            os.chmod(name, 0o600)
+            stream.write("\n".join(lines) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
 
