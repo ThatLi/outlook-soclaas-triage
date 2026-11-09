@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -124,14 +126,22 @@ def test_missing_task_handles_windows_dispatch_exception_without_hiding_denied_a
 
 @pytest.mark.skipif(shutil.which('powershell.exe') is None, reason='Windows PowerShell required')
 def test_source_scheduler_wrappers_share_plan_without_task_access(tmp_path):
-    root = Path(__file__).parents[1]
+    source = Path(__file__).parents[1]
+    root = tmp_path / 'source checkout'
+    (root / 'scripts').mkdir(parents=True)
+    for name in ('register_windows_tasks.ps1', 'register_cloud_bridge.ps1', 'invoke_scheduler.ps1'):
+        shutil.copyfile(source / 'scripts' / name, root / 'scripts' / name)
+    subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(root / '.venv')],
+                   check=True, capture_output=True, timeout=40)
+    environment = os.environ.copy()
+    environment['PYTHONPATH'] = os.pathsep.join([str(source / 'src'), *sys.path])
     target = tmp_path / 'Separate path 多 spaces'
     target.mkdir()
     for script, extra in [('register_windows_tasks.ps1', ['-EnableTelegram', '-EnableTelegramCommands']),
                           ('register_cloud_bridge.ps1', [])]:
         result = subprocess.run(['powershell.exe', '-NoProfile', '-File', str(root / 'scripts' / script),
                                  '-ProjectDir', str(target), '-ShowPlan', *extra], capture_output=True,
-                                text=True, encoding='utf-8', errors='replace', timeout=40)
+                                text=True, encoding='utf-8', errors='replace', timeout=40, env=environment)
         assert result.returncode == 0, result.stderr
         plan = json.loads(result.stdout)
         # PowerShell's legacy output encoding can replace non-ASCII redirected text;

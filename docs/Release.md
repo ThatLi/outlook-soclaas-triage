@@ -95,6 +95,6 @@ Still pending before public readiness: a clean Windows account with no developer
 Python installed; interactive installer/shortcut visual review; actual classic
 Outlook/profile and policy-denied cases; live SoCLaaS and Telegram checks;
 real timed sync/digest, lock/sleep/sign-out behavior; and live existing-cloud
-dataset/webhook acceptance. The GitHub-hosted workflow has not been run here.
+dataset/webhook acceptance. Check the [GitHub Actions release build](https://github.com/ThatLi/outlook-soclaas-triage/actions/workflows/windows-release.yml) for the hosted build result.
 The installer is unsigned. These pending checks remain release limitations,
 not implied passes from the automated tests or isolated install test.
