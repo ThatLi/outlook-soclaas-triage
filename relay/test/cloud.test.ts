@@ -308,6 +308,86 @@ describe("informational emails", () => {
   });
 });
 
+describe("temporary email preview messages", () => {
+  async function previewData(body = "Preview body") {
+    const data = fixture(); data.tasks.forEach(task => { task.preview = body; });
+    data.information = [{ id: 1, subject: "FYI", summary: "Summary", sender_name: "Sender", sender_address: "sender@test",
+      received_at: new Date().toISOString(), is_read: false, preview: body }];
+    await publish(data); return data;
+  }
+  function deleted() { return telegramCalls.filter(call => call.method === "deleteMessage").map(call => call.body.message_id); }
+  it.each(["#1", "#i1"])("keeps %s visible until a new valid command and then removes the preview and show command, preserving the brief", async reference => {
+    await previewData(); await command("/list"); await ack({ event_id: (await poll()).job!.id });
+    const brief = digestRows()[0].message_id;
+    telegramCalls = [];
+    await command(`/show ${reference}`, 830);
+    const preview = telegramCalls.find(call => call.method === "sendMessage")!.body.message_id ?? nextMessage;
+    await poll(); expect(deleted()).toHaveLength(0);
+    await command(`/show ${reference}`, 830); expect(deleted()).toHaveLength(0);
+    const sentBefore = sent.length;
+    await command("/waiting #1", 831);
+    expect(deleted()).toContain(830); expect(deleted()).toContain(preview);
+    expect(deleted()).not.toContain(brief);
+    expect(sent).toHaveLength(sentBefore);
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_outbox WHERE list_event_id=(SELECT id FROM cloud_events WHERE dedupe_key='tg:830')").get()!.count).toBe(0);
+  });
+  it("replaces an earlier preview when another show command arrives without deleting the new preview", async () => {
+    await previewData(); await command("/show #1", 832); const first = nextMessage;
+    await command("/show #2", 833); const second = nextMessage;
+    expect(deleted()).toContain(first); expect(deleted()).toContain(832);
+    expect(deleted()).not.toContain(second); expect(deleted()).not.toContain(833);
+    await poll(); expect(deleted()).not.toContain(second);
+  });
+  it("cancels undelivered parts of superseded previews and deletes every part already sent", async () => {
+    await previewData("&".repeat(6000)); await command("/list"); await ack({ event_id: (await poll()).job!.id });
+    telegramCalls = [];
+    await command("/show #1", 834);
+    const parts = telegramCalls.filter(call => call.method === "sendMessage").map((_, index) => nextMessage - 2 + index);
+    expect(parts).toHaveLength(3);
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_outbox WHERE list_event_id=(SELECT id FROM cloud_events WHERE dedupe_key='tg:834') AND delivered_at IS NULL").get()!.count).toBe(1);
+    const sentBefore = sent.length;
+    await command("/waiting #1", 835);
+    for (let i = 0; i < 3; i++) await poll();
+    expect(sent).toHaveLength(sentBefore);
+    for (const id of [834, ...parts]) expect(deleted()).toContain(id);
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_outbox WHERE list_event_id=(SELECT id FROM cloud_events WHERE dedupe_key='tg:834')").get()!.count).toBe(0);
+  });
+  it("does not expire previews on chat text, invalid commands, unauthorized updates, or scheduled work", async () => {
+    await previewData(); await command("/show #1", 836);
+    await command("hello"); await command("/read #999"); await command("/unknown");
+    await command("/help", 837, { chat: { id: 8, type: "private" } });
+    await runCloudScheduled(env);
+    expect(deleted()).not.toContain(836);
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_task_feedback WHERE event_id=(SELECT id FROM cloud_events WHERE dedupe_key='tg:836') AND delivered_at IS NULL").get()!.count).toBe(2);
+    await command("/help", 838);
+    expect(deleted()).toContain(836);
+  });
+  it.each([503, 429])("retries failed preview deletion (%s) without resending previews", async code => {
+    await previewData(); await command("/show #1", 839); const preview = nextMessage;
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("deleteMessage")
+      ? Response.json({ ok: false, parameters: { retry_after: code === 429 ? 30 : 0 } }, { status: code }) : normal(url, init)));
+    await command("/help", 840);
+    expect(deleted()).not.toContain(preview);
+    vi.setSystemTime(new Date(Date.now() + 31000)); vi.stubGlobal("fetch", telegramMock());
+    await poll();
+    expect(deleted()).toContain(preview); expect(deleted()).toContain(839);
+    expect(sent.filter(text => text.includes("Preview body"))).toHaveLength(1);
+  });
+  it("retires expired tracking without blocking other feedback or attempting impossible deletion", async () => {
+    await previewData(); await command("/show #1", 841);
+    vi.setSystemTime(new Date(Date.now() + 49 * 3600000));
+    await runCloudScheduled(env);
+    expect(deleted()).toHaveLength(0);
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_task_feedback WHERE event_id=(SELECT id FROM cloud_events WHERE dedupe_key='tg:841') AND delivered_at IS NULL").get()!.count).toBe(0);
+  });
+  it("keeps unavailable-preview errors visible", async () => {
+    await command("/show #1", 842); const error = nextMessage;
+    await command("/help");
+    expect(deleted()).not.toContain(842); expect(deleted()).not.toContain(error);
+  });
+});
+
 describe("quiet informational reads", () => {
   function informationData(): BridgeSnapshot {
     return { ...fixture(), information: [1, 2].map(id => ({ id, subject: `FYI ${id}`, summary: `Summary ${id}`,

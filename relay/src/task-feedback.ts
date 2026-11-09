@@ -81,9 +81,17 @@ async function feedbackDigests(env: Env, information: boolean) {
   }));
 }
 
-export async function taskFeedback(env: Env, event: number | string, ids: number[], cleanup?: { message?: number; date?: number }, allowFallback = true, information = false) {
+export function trackCleanup(env: Env, event: number | string, cleanup?: { message?: number; date?: number }, allowFallback = false) {
   const column = typeof event === "string" ? "dedupe_key" : "id";
   const validCleanup = Number.isSafeInteger(cleanup?.message) && cleanup!.message! > 0 && Number.isFinite(cleanup?.date);
+  return env.DB.prepare(`INSERT INTO cloud_task_feedback(event_id,command_message_id,expires_at,allow_fallback,created_at)
+    SELECT id,?,?,?,? FROM cloud_events WHERE ${column}=?`)
+    .bind(validCleanup ? cleanup!.message! : null, validCleanup ? cleanup!.date! * 1000 + 48 * 3600000 - 60000 : null,
+      allowFallback ? 1 : 0, new Date().toISOString(), event);
+}
+
+export async function taskFeedback(env: Env, event: number | string, ids: number[], cleanup?: { message?: number; date?: number }, allowFallback = true, information = false) {
+  const column = typeof event === "string" ? "dedupe_key" : "id";
   const relevant = information ? (await feedbackDigests(env, true)).filter(digest => digest.ids.some(id => ids.includes(id))) : [];
   const update = information
     ? env.DB.prepare(`UPDATE interactive_digests SET dirty=1,feedback_event=(SELECT id FROM cloud_events WHERE ${column}=?)
@@ -94,22 +102,28 @@ export async function taskFeedback(env: Env, event: number | string, ids: number
       .bind(event, singaporeClock(new Date()).date, ...ids);
   return [
     update,
-    env.DB.prepare(`INSERT INTO cloud_task_feedback(event_id,command_message_id,expires_at,allow_fallback,created_at)
-      SELECT id,?,?,?,? FROM cloud_events WHERE ${column}=?`)
-      .bind(validCleanup ? cleanup!.message! : null, validCleanup ? cleanup!.date! * 1000 + 48 * 3600000 - 60000 : null,
-        allowFallback ? 1 : 0, new Date().toISOString(), event),
+    trackCleanup(env, event, cleanup, allowFallback),
   ];
 }
 
 export async function flushFeedback(env: Env) {
   const pause = await env.DB.prepare("SELECT telegram_retry_at FROM cloud_lock WHERE singleton=1").first<{ telegram_retry_at: number }>();
   if (pause && pause.telegram_retry_at > Date.now()) return;
-  const rows = await env.DB.prepare("SELECT * FROM cloud_task_feedback WHERE delivered_at IS NULL AND retry_at<=? ORDER BY id LIMIT 3")
-    .bind(Date.now()).all<{ id: number; event_id: number; command_message_id: number | null; expires_at: number | null; allow_fallback: number; fallback_sent: number }>();
+  const rows = await env.DB.prepare(`SELECT feedback.* FROM cloud_task_feedback feedback
+    JOIN cloud_events event ON event.id=feedback.event_id
+    WHERE feedback.delivered_at IS NULL AND feedback.retry_at<=?
+    AND (event.action<>'show' OR feedback.expires_at IS NULL OR feedback.expires_at<=?
+      OR EXISTS (SELECT 1 FROM cloud_events newer WHERE newer.id>event.id AND newer.dedupe_key LIKE 'tg:%' AND newer.action<>'invalid'))
+    ORDER BY feedback.id LIMIT 3`)
+    .bind(Date.now(), Date.now()).all<{ id: number; event_id: number; command_message_id: number | null; expires_at: number | null; allow_fallback: number; fallback_sent: number }>();
   if (!rows.results.length) return;
   const digestsByKind = new Map<boolean, Awaited<ReturnType<typeof feedbackDigests>>>();
   for (const row of rows.results) {
     const event = (await env.DB.prepare("SELECT * FROM cloud_events WHERE id=?").bind(row.event_id).first<TaskEvent>())!;
+    if (event.action === "show" && (row.expires_at === null || row.expires_at <= Date.now())) {
+      await env.DB.prepare("UPDATE cloud_task_feedback SET delivered_at=? WHERE id=?").bind(new Date().toISOString(), row.id).run();
+      continue;
+    }
     if (event.action === "list") {
       if (event.status === "pending") continue;
       const digest = event.digest_id ? await env.DB.prepare("SELECT message_id,dirty,disabled FROM interactive_digests WHERE id=?")
@@ -120,7 +134,7 @@ export async function flushFeedback(env: Env) {
       }
       if (digest.message_id === null || digest.dirty) continue;
     }
-    const ids: number[] = JSON.parse(event.task_ids);
+    const ids: number[] = event.action === "show" ? [] : JSON.parse(event.task_ids);
     const information = event.action === "read_information";
     if (!digestsByKind.has(information)) digestsByKind.set(information, await feedbackDigests(env, information));
     const relevant = digestsByKind.get(information)!.filter(digest => digest.ids.some(id => ids.includes(id)));

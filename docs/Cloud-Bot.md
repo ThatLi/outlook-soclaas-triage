@@ -256,6 +256,14 @@ Already sent Telegram messages are unchanged. Previously requested `/show` repli
 including pending replies, retain the existing delivery and 30-day post-delivery
 cleanup policy; they are separate from the current preview cache.
 
+Successful `/show` previews are temporary chat messages. The next valid command
+in the configured private chat, including another `/show`, deletes the previous
+preview's parts and its `/show` command. Unsent older preview parts are cancelled.
+The daily brief, errors, and the new command's response are preserved. Retries
+and Telegram's deletion age limits still apply; previews sent before this update
+were not tracked and cannot be removed automatically. This does not erase the
+underlying eligible preview cache.
+
 ## Reliability, privacy, and recovery
 
 Task content, subjects, senders, previews, and replies are encrypted at rest using

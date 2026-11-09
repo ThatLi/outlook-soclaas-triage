@@ -435,3 +435,9 @@ within 72 hours. Completed/dismissed tasks and read/expired informational emails
 lose cloud previews automatically. If Outlook can no longer supply a body, its
 preview is omitted from the next publication. Summaries and task history are kept.
 Reopened tasks receive a preview after the next publication with caching enabled.
+
+Cloud `/show` previews and their accepted `/show` commands are removed when you
+send your next valid command. Another `/show` replaces the previous preview.
+All preview parts are tracked; unsent older parts are cancelled. Errors and the
+daily brief remain. Cleanup is subject to Telegram's deletion limits, and older
+untracked previews may require manual deletion.
