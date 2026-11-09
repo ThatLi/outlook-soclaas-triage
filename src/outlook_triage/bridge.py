@@ -78,6 +78,8 @@ def publish_bridge(db: Database, settings: Settings, client: BridgeClient, *, ca
         with process_lock(settings.lock_dir):
             with outlook_factory(settings.outlook_profile, timezone=settings.timezone) as outlook:
                 for task in tasks:
+                    if task["status"] not in {"open", "waiting"}:
+                        continue
                     row = db.task_email(task["id"])
                     try:
                         task["preview"] = outlook.get_body_preview(
@@ -87,6 +89,8 @@ def publish_bridge(db: Database, settings: Settings, client: BridgeClient, *, ca
                         # Missing/moved mail must not stop publication of the other tasks.
                         continue
                 for item in information:
+                    if item["is_read"] is not False:
+                        continue
                     row = db.information_email(item["id"])
                     try:
                         item["preview"] = outlook.get_body_preview(

@@ -1,5 +1,5 @@
 import {
-  decryptEnvelope, escapeHtml, singaporeClock, telegramSend, validateEnvelope,
+  decryptEnvelope, encryptEnvelope, escapeHtml, singaporeClock, telegramSend, validateEnvelope,
   type BundlePayload, type Env,
 } from "./index";
 import { deliverDigest, digestCallback, dirtyDigests, ensureDigestLayouts, queueDigest, refreshDigests, type DigestCallback, type DigestRow } from "./interactive-digest";
@@ -122,6 +122,35 @@ export function informationalEmails(data: BridgeSnapshot, now: Date, frozen = fa
   return (data.information ?? []).filter(item => item.is_read === false
     && (frozen || (Date.parse(item.received_at) > now.getTime() - 72 * 3600000 && Date.parse(item.received_at) <= now.getTime())))
     .sort((a, b) => Date.parse(b.received_at) - Date.parse(a.received_at) || a.id - b.id);
+}
+
+function previewAvailable(item: CloudTask | InformationEmail, now: Date): boolean {
+  if ("status" in item) return ["open", "waiting"].includes(item.status);
+  return item.is_read === false && Date.parse(item.received_at) > now.getTime() - 72 * 3600000
+    && Date.parse(item.received_at) <= now.getTime();
+}
+
+async function pruneSnapshotPreviews(env: Env, now = new Date()): Promise<void> {
+  const row = await env.DB.prepare("SELECT envelope_json FROM cloud_snapshot WHERE singleton=1").first<{ envelope_json: string }>();
+  if (!row) return;
+  const envelope = validateEnvelope(JSON.parse(row.envelope_json));
+  const payload = await decryptEnvelope(envelope, env.RELAY_ENCRYPTION_KEY);
+  const data = validateBridge(payload.bridge);
+  const states = await env.DB.prepare("SELECT id,status FROM cloud_tasks").all<{ id: number; status: Status }>();
+  const lookup = new Map(states.results.map(task => [task.id, task.status]));
+  let changed = false;
+  for (const item of [...data.tasks, ...(data.information ?? [])]) {
+    const effective = "status" in item ? { ...item, status: lookup.get(item.id) ?? item.status } : item;
+    if (item.preview !== undefined && !previewAvailable(effective, now)) {
+      delete item.preview;
+      changed = true;
+    }
+  }
+  if (changed) {
+    const updated = await encryptEnvelope(envelope, payload, env.RELAY_ENCRYPTION_KEY);
+    await env.DB.prepare("UPDATE cloud_snapshot SET envelope_json=? WHERE singleton=1")
+      .bind(JSON.stringify(updated)).run();
+  }
 }
 
 export function informationParts(item: InformationEmail): string[] {
@@ -363,7 +392,8 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       chunks = textChunks(`Tasks · ${cmd.option}\n${tasks.map(t => `#${t.id} [${t.status}] [${t.urgency}] ${t.description}${t.deadline ? ` — due ${t.deadline}` : ""}`).join("\n\n") || "No matching tasks."}`);
     } else if (cmd.action === "show") {
       const task = (cmd.information ? data.information : data.tasks)!.find(t => t.id === ids[0])!;
-      chunks = task.preview === undefined ? ["No cached body preview. Enable bridge preview caching on Windows and reconnect."]
+      chunks = !previewAvailable(task, new Date()) ? ["This email is no longer eligible for a cached preview."]
+        : task.preview === undefined ? ["No cached body preview. Enable bridge preview caching on Windows and reconnect."]
         : textChunks(`Email preview · ${task.subject}\nCached at the last bridge publication; bounded preview.\n\n${task.preview || "(empty body)"}`);
     } else if (["waiting", "reopen"].includes(cmd.action)) {
       chunks = textChunks(`Cloud tasks ${ids.map(id => `#${id}`).join(", ")} marked ${cmd.action === "waiting" ? "waiting" : "open"}.`);
@@ -406,6 +436,7 @@ async function acceptSnapshot(request: Request, env: Env): Promise<Response> {
     statements.push(dirtyDigests(env));
     // Batch in one transaction: a task import and its encrypted details stay consistent.
     await env.DB.batch(statements);
+    await pruneSnapshotPreviews(env);
     await flush(env);
     return Response.json({ status: "stored", bundle_id: envelope.bundle_id });
   });
@@ -466,6 +497,7 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
     }
     if (["read", "done", "dismiss"].includes(event.action)) statements.push(...await taskFeedback(env, event.id, ids, undefined, !body.failed));
     if (statements.length) await env.DB.batch(statements);
+    if (["done", "dismiss", "read_information"].includes(event.action)) await pruneSnapshotPreviews(env);
     await flush(env);
     return Response.json({ ok: true });
   });
@@ -492,6 +524,7 @@ export async function cloudFetch(request: Request, env: Env): Promise<Response> 
 
 export async function runCloudScheduled(env: Env, now = new Date()): Promise<void> {
   await withLock(env, async () => {
+    await pruneSnapshotPreviews(env, now);
     const clock = singaporeClock(now);
     const key = `digest:${clock.date}`;
     if (clock.hour >= 8 && !await env.DB.prepare("SELECT id FROM cloud_events WHERE dedupe_key=?").bind(key).first()) {

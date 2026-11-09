@@ -123,6 +123,19 @@ export async function decryptEnvelope(envelope: BundleEnvelope, encodedKey: stri
   return validatePayload(JSON.parse(new TextDecoder().decode(plaintext)));
 }
 
+export async function encryptEnvelope(envelope: BundleEnvelope, payload: BundlePayload, encodedKey: string): Promise<BundleEnvelope> {
+  const encode = (bytes: Uint8Array) => btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(""))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const updated = { ...envelope, nonce: encode(nonce) };
+  const key = await crypto.subtle.importKey("raw", decodeBase64Url(encodedKey), "AES-GCM", false, ["encrypt"]);
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: nonce, additionalData: canonicalMetadata(updated) },
+    key, new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  return { ...updated, ciphertext: encode(new Uint8Array(ciphertext)) };
+}
+
 function authorized(request: Request, env: Env): boolean {
   return request.headers.get("authorization") === `Bearer ${env.RELAY_TOKEN}`;
 }

@@ -196,6 +196,46 @@ def test_previews_are_bounded_and_opt_in(bridge):
     assert "private " not in str(client.envelopes[0])
 
 
+def test_preview_publication_removes_ineligible_and_inaccessible_bodies(bridge):
+    from datetime import timedelta
+    from test_information import add_information
+    db, config, client = bridge
+    now = datetime.now(config.timezone)
+    for source, read, hours in [("unread", False, 0), ("read", True, 0), ("unknown", False, 0), ("expired", False, 73)]:
+        add_information(db, now - timedelta(hours=hours), source, is_read=read)
+    db.connection.execute("UPDATE emails SET is_read=NULL WHERE message_key='unknown'")
+    db.connection.commit()
+    calls = []
+    class Outlook:
+        missing = False
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get_body_preview(self, source, store, *, limit):
+            calls.append(source)
+            if self.missing and source == "entry1": raise OutlookError("no access")
+            return "Cached body"
+    publish_bridge(db, config, client, cache_previews=True, outlook_factory=Outlook)
+    assert set(calls) == {"entry1", "entry2", "unread"}
+    db.set_task_status(2, "done")
+    db.set_task_status(1, "waiting")
+    Outlook.missing = True
+    calls.clear()
+    publish_bridge(db, config, client, cache_previews=True, outlook_factory=Outlook)
+    data = decrypt_payload(client.envelopes[-1], TEST_ENCRYPTION_KEY)["bridge"]
+    assert set(calls) == {"entry1", "unread"}
+    assert all("preview" not in task for task in data["tasks"])
+    assert [item["source_id"] for item in db.information(now, unread_only=True)] == ["unread"]
+    assert [item["id"] for item in data["information"] if "preview" in item] == [db.information(now, unread_only=True)[0]["id"]]
+    calls.clear()
+    db.set_task_status(1, "dismissed")
+    db.set_email_read("unread", True)
+    publish_bridge(db, config, client, cache_previews=True, outlook_factory=Outlook)
+    assert calls == []
+    data = decrypt_payload(client.envelopes[-1], TEST_ENCRYPTION_KEY)["bridge"]
+    assert all("preview" not in item for item in data["tasks"] + data["information"])
+
+
 def test_failed_scheduled_publication_retries_without_resyncing(bridge):
     db, config, client = bridge
     calls = []

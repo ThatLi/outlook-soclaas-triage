@@ -240,8 +240,21 @@ queue service is needed.
 Use `-CachePreviews` with the scheduler, or `bridge-listen --cache-previews`, to
 upload bounded original email text for `/show`. Default: off. This additionally
 sends original body text to Cloudflare and, on request, Telegram. Attachments are
-never read. Disabling the option and publishing removes previews from the current
-snapshot; previous Telegram messages and pending frozen responses may retain them.
+never read. Only open/waiting tasks and confirmed unread informational emails
+received within the last 72 hours receive previews. Closed tasks, read/expired
+informational emails, and inaccessible Outlook items have no preview in the next
+publication. Other metadata and summaries remain available.
+
+The cloud also removes closed-task previews after Outlook confirms completion,
+and removes expired informational previews through its existing minute schedule,
+including while Windows is offline. `/show` refuses ineligible cached previews
+immediately. Cleanup preserves the original snapshot timestamps and encryption.
+Reopening a task requires a new bridge publication to restore its preview.
+
+Disabling caching and publishing removes all previews from the current snapshot.
+Already sent Telegram messages are unchanged. Previously requested `/show` replies,
+including pending replies, retain the existing delivery and 30-day post-delivery
+cleanup policy; they are separate from the current preview cache.
 
 ## Reliability, privacy, and recovery
 

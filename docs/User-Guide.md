@@ -423,3 +423,9 @@ Cloud read commands wait for the Windows bridge. Cloud `/show` requires the brid
 existing `--cache-previews` option; previews are bounded and encrypted. Summaries
 are reused from classification without another SoCLaaS request. Informational
 summaries are included in the configured Telegram destination.
+
+Cached previews are limited to open/waiting tasks and unread informational emails
+within 72 hours. Completed/dismissed tasks and read/expired informational emails
+lose cloud previews automatically. If Outlook can no longer supply a body, its
+preview is omitted from the next publication. Summaries and task history are kept.
+Reopened tasks receive a preview after the next publication with caching enabled.

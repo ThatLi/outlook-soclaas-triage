@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker, { type Env } from "../src/index";
+import worker, { decryptEnvelope, type Env } from "../src/index";
 import { parseCloudCommand, renderDigest, runCloudScheduled, textChunks, validateBridge, type BridgeSnapshot } from "../src/cloud";
 import { digestMessage, type DigestRow } from "../src/interactive-digest";
 import { unseal } from "../src/cloud";
@@ -163,6 +163,78 @@ beforeEach(async () => {
   expect((await publish()).status).toBe(200);
 });
 afterEach(() => { database.db.close(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe("preview retention", () => {
+  async function saved() {
+    const row = database.db.prepare("SELECT envelope_json,generated_ms,last_seen FROM cloud_snapshot").get()!;
+    const value = JSON.parse(String(row.envelope_json));
+    const payload = await decryptEnvelope(value, env.RELAY_ENCRYPTION_KEY);
+    return { row, envelope: value, data: payload.bridge! };
+  }
+  function dataWithPreviews(): BridgeSnapshot {
+    const data = fixture();
+    data.tasks.forEach(task => { task.preview = `task body ${task.id}`; });
+    data.information = [{ id: 1, summary: "FYI", subject: "FYI", sender_name: "Sender", sender_address: "sender@test",
+      received_at: new Date(Date.now() - 71 * 3600000).toISOString(), is_read: false, preview: "information body" }];
+    return data;
+  }
+  it("purges closed and read previews from stored encrypted snapshots, retaining eligible bodies", async () => {
+    const data = dataWithPreviews();
+    database.db.prepare("UPDATE cloud_tasks SET status='done' WHERE id=1").run();
+    data.information![0].is_read = true;
+    await publish(data);
+    const stored = await saved();
+    expect(stored.data.tasks[0].preview).toBeUndefined();
+    expect(stored.data.tasks[1].preview).toBe("task body 2");
+    expect(stored.data.information![0].preview).toBeUndefined();
+    expect(stored.data.information![0].summary).toBe("FYI");
+    expect(String(stored.row.envelope_json)).not.toContain("task body 2");
+    await command("/show #1");
+    expect(sent.at(-1)).toContain("no longer eligible");
+  });
+  it("expires informational bodies while Windows is offline, preserving freshness and using a new nonce", async () => {
+    await publish(dataWithPreviews());
+    const before = await saved();
+    vi.setSystemTime(new Date(Date.now() + 3600000));
+    await command("/show #i1");
+    expect(sent.at(-1)).toContain("no longer eligible");
+    await runCloudScheduled(env);
+    const after = await saved();
+    expect(after.data.information![0].preview).toBeUndefined();
+    expect(after.data.tasks[0].preview).toBe("task body 1");
+    expect(after.row.generated_ms).toBe(before.row.generated_ms);
+    expect(after.row.last_seen).toBe(before.row.last_seen);
+    expect(after.envelope.generated_at).toBe(before.envelope.generated_at);
+    expect(after.envelope.nonce).not.toBe(before.envelope.nonce);
+    const sealed = after.row.envelope_json;
+    await runCloudScheduled(env);
+    expect((await saved()).row.envelope_json).toBe(sealed);
+  });
+  it.each(["done", "dismiss"])("removes a task preview after %s confirmation and waits for a new publication after reopen", async action => {
+    await publish(dataWithPreviews());
+    await command(`/${action} #1`);
+    expect((await saved()).data.tasks[0].preview).toBe("task body 1");
+    const job = (await poll()).job!;
+    await ack({ event_id: job.id, task_id: 1 });
+    expect((await saved()).data.tasks[0].preview).toBeUndefined();
+    expect((await saved()).data.tasks[1].preview).toBe("task body 2");
+    await command("/reopen #1");
+    await command("/show #1");
+    expect(sent.at(-1)).toContain("No cached body preview");
+  });
+  it("keeps open and waiting previews, drops expired or unknown-read previews on upload, and clears disabled caching", async () => {
+    const data = dataWithPreviews();
+    database.db.prepare("UPDATE cloud_tasks SET status='waiting' WHERE id=1").run();
+    data.information![0].is_read = null;
+    data.information!.push({ ...data.information![0], id: 2, is_read: false, received_at: new Date(Date.now() - 73 * 3600000).toISOString() });
+    await publish(data);
+    expect((await saved()).data.tasks.every(task => task.preview !== undefined)).toBe(true);
+    expect((await saved()).data.information!.every(item => item.preview === undefined)).toBe(true);
+    data.tasks.forEach(task => { delete task.preview; });
+    await publish(data);
+    expect((await saved()).data.tasks.every(task => task.preview === undefined)).toBe(true);
+  });
+});
 
 describe("informational emails", () => {
   function withInformation(): BridgeSnapshot {
