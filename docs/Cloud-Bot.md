@@ -307,6 +307,15 @@ read status before acknowledging completion. Partial successes are retained and
 retries are safe. Reading directly in Outlook is reflected after synchronization.
 Cloud previews require `--cache-previews`; summary delivery does not.
 
+Informational `/read #i42` follows quiet task feedback: the current digest shows
+read progress, then removes confirmed read entries. Covered commands do not send
+separate queued/marked replies. The accepted command is deleted only after its
+feedback is visible, and retries preserve partial successes. If no editable
+current digest covers an informational reference, a concise fallback identifies
+the `#i` references. Failures and `/show` previews remain visible. Deletion uses
+the existing age limits and retry handling. Old notices sent before this update
+were not tracked for cleanup and may need manual deletion.
+
 New editions select the current 72-hour window. An existing edition preserves its
 original summaries and membership, while confirmed reads can remove entries from
 current editions. Older delivered editions remain frozen.

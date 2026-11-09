@@ -282,7 +282,7 @@ describe("informational emails", () => {
     data.information![0].is_read = true; await publish(data);
     await ack({ event_id: job.id, task_id: 1 });
     expect(state(1)!.status).toBe("open");
-    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_task_feedback WHERE event_id=?").get(job.id)!.count).toBe(0);
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_task_feedback WHERE event_id=?").get(job.id)!.count).toBe(2);
     expect(sent.join("\n")).toContain("#i1");
     expect(renderDigest(data).join("\n")).not.toContain("/read #i1");
   });
@@ -305,6 +305,129 @@ describe("informational emails", () => {
     await command("/list");
     const fresh = digestRows().find(digest => digest.id !== row.id)!;
     expect((await storedPages(fresh)).join("\n")).toContain("New arrival");
+  });
+});
+
+describe("quiet informational reads", () => {
+  function informationData(): BridgeSnapshot {
+    return { ...fixture(), information: [1, 2].map(id => ({ id, subject: `FYI ${id}`, summary: `Summary ${id}`,
+      sender_name: "Sender", sender_address: "sender@test", received_at: new Date().toISOString(), is_read: false })) };
+  }
+  async function tracked(data = informationData()) {
+    await publish(data); await command("/list");
+    await ack({ event_id: (await poll()).job!.id });
+    return data;
+  }
+  async function html() { return (await storedPages(digestRows()[0])).join("\n"); }
+  it.each(["rich", "legacy"])("shows pending progress and removes confirmed entries quietly in %s digests", async format => {
+    legacyFixture.enabled = format === "legacy";
+    const data = await tracked(); const before = sent.length; telegramCalls = [];
+    await command("/read #i1", 810);
+    const job = (await poll()).job!;
+    expect(await html()).toContain("ℹ️ <code>#i1</code> <i>· ⏳ Read pending</i>");
+    expect(await html()).not.toContain("☐ <code>#1</code> <i>· ⏳ Read pending</i>");
+    expect(digestRows()[0].feedback_text).toContain("/read · 0/1 confirmed · informational emails");
+    expect(telegramCalls.at(-1)).toMatchObject({ method: "deleteMessage", body: { message_id: 810 } });
+    expect(telegramCalls.slice(0, -1).every(call => call.method === "editMessageText")).toBe(true);
+    data.information![0].is_read = true; await publish(data);
+    await ack({ event_id: job.id, task_id: 1 });
+    expect(await html()).not.toContain("/show #i1");
+    expect(await html()).toContain("/show #i2");
+    expect(digestRows()[0].feedback_text).toContain("/read · 1/1 confirmed · informational emails");
+    expect(sent).toHaveLength(before);
+    expect(state(1)!.status).toBe("open");
+    const count = telegramCalls.length;
+    await command("/read #i1", 810); await ack({ event_id: job.id, task_id: 1 });
+    expect(telegramCalls).toHaveLength(count);
+  });
+  it("keeps partial successes and actionable errors visible, and clears failure notes on retry", async () => {
+    const data = await tracked(); const before = sent.length;
+    await command("/read #i1 #i2"); const job = (await poll()).job!;
+    data.information![0].is_read = true; await publish(data);
+    await ack({ event_id: job.id, task_id: 1 });
+    expect(await html()).not.toContain("/show #i1");
+    expect(await html()).toContain("#i2</code> <i>· ⏳ Read pending</i>");
+    await ack({ event_id: job.id, failed: true });
+    expect(await html()).toContain("#i2</code> <i>· ⚠ /read failed</i>");
+    expect(sent.slice(before)).toHaveLength(1);
+    expect(sent.at(-1)).toContain("1/2 completed. Earlier successes were kept");
+    await command("/read #i2");
+    expect(await html()).not.toContain("⚠ /read failed</i>");
+    const retry = (await poll()).job!;
+    data.information![1].is_read = true; await publish(data);
+    await ack({ event_id: retry.id, task_id: 2 });
+    expect(await html()).not.toContain("/show #i2");
+    expect(sent.slice(before)).toHaveLength(1);
+  });
+  it("waits for failed digest edits before deleting a command, without repeating mailbox work", async () => {
+    await tracked(); const before = sent.length; telegramCalls = [];
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("editMessageText")
+      ? Response.json({ ok: false }, { status: 503 }) : normal(url, init)));
+    await command("/read #i1", 811);
+    expect(telegramCalls.some(call => call.method === "deleteMessage")).toBe(false);
+    expect(digestRows()[0].dirty).toBe(1);
+    vi.setSystemTime(new Date(Date.now() + 6000)); vi.stubGlobal("fetch", telegramMock());
+    await command("/read #i1", 811);
+    expect(telegramCalls.at(-1)).toMatchObject({ method: "deleteMessage", body: { message_id: 811 } });
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM cloud_events WHERE dedupe_key='tg:811'").get()!.count).toBe(1);
+    expect(sent).toHaveLength(before);
+  });
+  it("retries rate-limited deletion without sending new acknowledgements", async () => {
+    await tracked(); const before = sent.length;
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("deleteMessage")
+      ? Response.json({ ok: false, parameters: { retry_after: 30 } }, { status: 429 }) : normal(url, init)));
+    await command("/read #i1", 812);
+    const fetcher = telegramMock(); vi.stubGlobal("fetch", fetcher);
+    await poll(); expect(fetcher).not.toHaveBeenCalled();
+    vi.setSystemTime(new Date(Date.now() + 31000)); await poll();
+    expect(telegramCalls.at(-1)).toMatchObject({ method: "deleteMessage", body: { message_id: 812 } });
+    expect(sent).toHaveLength(before);
+  });
+  it("uses informational fallback replies when no current digest covers the email, without confusing task IDs", async () => {
+    await command("/list"); await ack({ event_id: (await poll()).job!.id });
+    const feedbackBefore = digestRows()[0].feedback_event;
+    const data = informationData(); await publish(data); const before = sent.length;
+    await command("/read #i1", 813);
+    const job = (await poll()).job!;
+    expect(digestRows()[0].feedback_event).toBe(feedbackBefore);
+    expect(sent.slice(before)).toHaveLength(1);
+    expect(sent.at(-1)).toContain("/read · 0/1 confirmed · informational emails");
+    expect(sent.at(-1)).toContain("#i1");
+    expect(telegramCalls.at(-1)).toMatchObject({ method: "deleteMessage", body: { message_id: 813 } });
+    data.information![0].is_read = true; await publish(data); await ack({ event_id: job.id, task_id: 1 });
+    expect(sent.slice(before)).toHaveLength(2);
+    expect(sent.at(-1)).toContain("read: #i1");
+    expect(state(1)!.status).toBe("open");
+  });
+  it("falls back when the digest is inaccessible and leaves invalid commands and previews intact", async () => {
+    await tracked(); const before = sent.length;
+    const normal = telegramMock();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => url.endsWith("editMessageText")
+      ? Response.json({ ok: false, description: "Bad Request: message to edit not found" }, { status: 400 }) : normal(url, init)));
+    await command("/read #i1", 814);
+    expect(sent.slice(before)).toHaveLength(1);
+    expect(sent.at(-1)).toContain("#i1");
+    expect(telegramCalls.at(-1)).toMatchObject({ method: "deleteMessage", body: { message_id: 814 } });
+    telegramCalls = [];
+    await command("/read #i999", 815); await command("/read #1 #i1", 816); await command("/show #i1", 817);
+    expect(telegramCalls.every(call => call.method === "sendMessage")).toBe(true);
+  });
+  it("skips expired command deletion while keeping quiet digest feedback", async () => {
+    await tracked(); const before = sent.length; telegramCalls = [];
+    await command("/read #i1", 818, { date: Math.floor(Date.now() / 1000) - 49 * 3600 });
+    expect(await html()).toContain("Read pending");
+    expect(telegramCalls.every(call => call.method !== "deleteMessage")).toBe(true);
+    expect(sent).toHaveLength(before);
+  });
+  it("does not delete invalid or unauthorized informational read commands", async () => {
+    await tracked(); telegramCalls = [];
+    await command("/read #i1", 819, { chat: { id: 8, type: "private" } });
+    expect(telegramCalls).toHaveLength(0);
+    expect(database.db.prepare("SELECT id FROM cloud_events WHERE dedupe_key='tg:819'").get()).toBeUndefined();
+    await command("/read #i999", 820);
+    expect(telegramCalls.every(call => call.method === "sendMessage")).toBe(true);
   });
 });
 

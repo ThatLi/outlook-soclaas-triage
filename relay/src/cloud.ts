@@ -153,10 +153,10 @@ async function pruneSnapshotPreviews(env: Env, now = new Date()): Promise<void> 
   }
 }
 
-export function informationParts(item: InformationEmail): string[] {
+export function informationParts(item: InformationEmail, annotation = ""): string[] {
   const reference = `<code>#i${item.id}</code>`;
   return [
-    ...textChunks(item.subject, 1800).map(value => `ℹ️ ${reference} <b>${value}</b>`),
+    ...textChunks(item.subject, 1800).map(value => `ℹ️ ${reference}${annotation} <b>${value}</b>`),
     ...textChunks(item.sender_name || item.sender_address, 1800).map(value => `<i>${value}</i>`),
     ...textChunks(item.summary, 1800),
     `<code>/show #i${item.id}</code> · <code>/read #i${item.id}</code>`,
@@ -272,7 +272,7 @@ export function digestTaskGroups(data: BridgeSnapshot, now = new Date(), fixedGr
   return groups;
 }
 
-export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>(), frozenInformation = false): string[] {
+export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>(), frozenInformation = false, informationAnnotations = new Map<number, string>()): string[] {
   const today = singaporeClock(now).date;
   const groups = digestTaskGroups(data, now, fixedGroups);
   const emojis = ["🔴", "🟠", "🟡", "⚪", "💤"];
@@ -304,7 +304,7 @@ export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups
   }
   const information = informationalEmails(data, now, frozenInformation);
   const infoTitle = "ℹ️ <b>INFORMATIONAL EMAILS · LAST 72 HOURS</b>";
-  const infoPages = packDigestBlocks(information.flatMap(informationParts), 2800);
+  const infoPages = packDigestBlocks(information.flatMap(item => informationParts(item, informationAnnotations.get(item.id))), 2800);
   const pages = [...messages, ...packDigestBlocks(compact),
     ...(infoPages.length ? infoPages.map(page => `${infoTitle}\n\n${page}`) : [
       `${groups.every(([, tasks]) => tasks.every(task => !["open", "waiting"].includes(task.status))) ? "No active tasks.\n\n" : ""}${infoTitle}\n\nNo unread informational emails.`])];
@@ -374,7 +374,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     if (data?.processed_telegram_updates?.includes(update.update_id!)) return Response.json({ ok: true });
     const ids = cmd?.ids ?? [];
     const missing = ids.filter(id => !(cmd?.information ? data?.information : data?.tasks)?.some(t => t.id === id));
-    const quiet = Boolean(cmd && !cmd.information && data && !missing.length && ["read", "done", "dismiss", "waiting", "reopen"].includes(cmd.action));
+    const quiet = Boolean(cmd && data && !missing.length && ["read", "done", "dismiss", "waiting", "reopen"].includes(cmd.action));
     if (quiet) await ensureDigestLayouts(env, data!);
     let chunks: string[];
     let pending = false;
@@ -413,7 +413,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       const digest = await queueDigest(env);
       statements.push(...digest.statements, env.DB.prepare("UPDATE cloud_events SET digest_id=? WHERE dedupe_key=?").bind(digest.id, key));
     }
-    if (quiet) statements.push(...await taskFeedback(env, key, ids, { message: message.message_id, date: message.date }));
+    if (quiet) statements.push(...await taskFeedback(env, key, ids, { message: message.message_id, date: message.date }, true, cmd!.information));
     else statements.push(await outbox(env, chunks, cmd?.action === "list" && pending ? key : undefined));
     await env.DB.batch(statements);
     await flush(env);
@@ -492,10 +492,11 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
       const chunks = textChunks(message);
       if (event.action === "list" && event.digest_id) statements.push(env.DB.prepare("UPDATE interactive_digests SET dirty=1 WHERE id=? AND digest_date=? AND disabled=0")
         .bind(event.digest_id, singaporeClock(new Date()).date));
-      if (body.failed || !["read", "done", "dismiss"].includes(event.action)) statements.push(await outbox(env, chunks,
+      if (body.failed || !["read", "done", "dismiss", "read_information"].includes(event.action)) statements.push(await outbox(env, chunks,
         event.action === "list" && !body.failed ? event.id : undefined));
     }
     if (["read", "done", "dismiss"].includes(event.action)) statements.push(...await taskFeedback(env, event.id, ids, undefined, !body.failed));
+    if (event.action === "read_information") statements.push(...await taskFeedback(env, event.id, ids, undefined, !body.failed, true));
     if (statements.length) await env.DB.batch(statements);
     if (["done", "dismiss", "read_information"].includes(event.action)) await pruneSnapshotPreviews(env);
     await flush(env);

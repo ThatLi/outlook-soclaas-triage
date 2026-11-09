@@ -1,6 +1,7 @@
 import type { Env } from "./index";
 import { escapeHtml, singaporeClock } from "./index";
 import { TelegramFailure, telegramRequest } from "./telegram-api";
+import { unseal } from "./cloud_crypto";
 
 export interface TaskState { id: number; status: string; revision: number }
 export interface TaskEvent { id: number; action: string; status: string; task_ids: string; completed_ids: string; digest_id?: string | null }
@@ -28,7 +29,7 @@ export function digestGroups(pages: string[]): DigestGroup[] {
 
 export async function effectiveStates(env: Env) {
   const tasks = await env.DB.prepare("SELECT id,status,revision FROM cloud_tasks").all<TaskState>();
-  const events = await env.DB.prepare("SELECT id,action,status,task_ids,completed_ids FROM cloud_events WHERE action IN ('read','done','dismiss') ORDER BY id").all<TaskEvent>();
+  const events = await env.DB.prepare("SELECT id,action,status,task_ids,completed_ids FROM cloud_events WHERE action IN ('read','done','dismiss','read_information') ORDER BY id").all<TaskEvent>();
   return { tasks: new Map(tasks.results.map(task => [task.id, task])), events: events.results };
 }
 
@@ -36,6 +37,7 @@ export async function effectiveStates(env: Env) {
 export function annotation(id: number, state: TaskState | undefined, events: TaskEvent[]): string {
   let workflow = "", read = "";
   for (const event of events) {
+    if (event.action === "read_information") continue;
     if (!JSON.parse(event.task_ids).includes(id) || (event.action !== "read" && event.id < (state?.revision ?? 0))) continue;
     let note = "";
     if (JSON.parse(event.completed_ids).includes(id)) {
@@ -50,19 +52,48 @@ export function annotation(id: number, state: TaskState | undefined, events: Tas
 
 export function feedbackLabel(event: TaskEvent): string {
   const count = JSON.parse(event.task_ids).length;
-  const progress = ["read", "done", "dismiss"].includes(event.action)
+  const progress = ["read", "done", "dismiss", "read_information"].includes(event.action)
     ? `${JSON.parse(event.completed_ids).length}/${count} confirmed` : `${count} task${count === 1 ? "" : "s"}`;
   const label = event.status === "pending" ? "⏳ Pending Outlook confirmation" : event.status === "failed" ? "⚠ Failed; earlier successes kept" : "✅ Completed";
-  return `${label}: /${event.action} · ${progress}`;
+  return `${label}: /${event.action === "read_information" ? "read" : event.action} · ${progress}${event.action === "read_information" ? " · informational emails" : ""}`;
 }
 
-export async function taskFeedback(env: Env, event: number | string, ids: number[], cleanup?: { message?: number; date?: number }, allowFallback = true) {
+export function informationAnnotation(id: number, events: TaskEvent[]): string {
+  let note = "";
+  for (const event of events) {
+    if (event.action !== "read_information" || !JSON.parse(event.task_ids).includes(id)) continue;
+    note = JSON.parse(event.completed_ids).includes(id) ? "" : event.status === "pending"
+      ? "⏳ Read pending" : event.status === "failed" ? "⚠ /read failed" : "";
+  }
+  return note ? ` <i>· ${note}</i>` : "";
+}
+
+async function feedbackDigests(env: Env, information: boolean) {
+  const rows = await env.DB.prepare("SELECT id,task_ids_json,sealed_layout,message_id,dirty FROM interactive_digests WHERE digest_date=? AND disabled=0")
+    .bind(singaporeClock(new Date()).date).all<{ id: string; task_ids_json: string; sealed_layout: string | null; message_id: number | null; dirty: number }>();
+  return Promise.all(rows.results.map(async digest => {
+    let ids: number[] = JSON.parse(digest.task_ids_json);
+    if (information) {
+      const layout = digest.sealed_layout ? JSON.parse((await unseal(env, digest.id, digest.sealed_layout))[0]) : null;
+      ids = (layout?.information ?? []).map((item: { id: number }) => item.id);
+    }
+    return { ...digest, ids };
+  }));
+}
+
+export async function taskFeedback(env: Env, event: number | string, ids: number[], cleanup?: { message?: number; date?: number }, allowFallback = true, information = false) {
   const column = typeof event === "string" ? "dedupe_key" : "id";
   const validCleanup = Number.isSafeInteger(cleanup?.message) && cleanup!.message! > 0 && Number.isFinite(cleanup?.date);
-  return [
-    env.DB.prepare(`UPDATE interactive_digests SET dirty=1,feedback_event=(SELECT id FROM cloud_events WHERE ${column}=?)
+  const relevant = information ? (await feedbackDigests(env, true)).filter(digest => digest.ids.some(id => ids.includes(id))) : [];
+  const update = information
+    ? env.DB.prepare(`UPDATE interactive_digests SET dirty=1,feedback_event=(SELECT id FROM cloud_events WHERE ${column}=?)
+      WHERE id IN (${relevant.length ? relevant.map(() => "?").join(",") : "NULL"})`)
+      .bind(event, ...relevant.map(digest => digest.id))
+    : env.DB.prepare(`UPDATE interactive_digests SET dirty=1,feedback_event=(SELECT id FROM cloud_events WHERE ${column}=?)
       WHERE digest_date=? AND disabled=0 AND EXISTS (SELECT 1 FROM json_each(task_ids_json) WHERE value IN (${ids.map(() => "?").join(",")}))`)
-      .bind(event, singaporeClock(new Date()).date, ...ids),
+      .bind(event, singaporeClock(new Date()).date, ...ids);
+  return [
+    update,
     env.DB.prepare(`INSERT INTO cloud_task_feedback(event_id,command_message_id,expires_at,allow_fallback,created_at)
       SELECT id,?,?,?,? FROM cloud_events WHERE ${column}=?`)
       .bind(validCleanup ? cleanup!.message! : null, validCleanup ? cleanup!.date! * 1000 + 48 * 3600000 - 60000 : null,
@@ -76,8 +107,7 @@ export async function flushFeedback(env: Env) {
   const rows = await env.DB.prepare("SELECT * FROM cloud_task_feedback WHERE delivered_at IS NULL AND retry_at<=? ORDER BY id LIMIT 3")
     .bind(Date.now()).all<{ id: number; event_id: number; command_message_id: number | null; expires_at: number | null; allow_fallback: number; fallback_sent: number }>();
   if (!rows.results.length) return;
-  const digests = await env.DB.prepare("SELECT task_ids_json,message_id,dirty FROM interactive_digests WHERE digest_date=? AND disabled=0")
-    .bind(singaporeClock(new Date()).date).all<{ task_ids_json: string; message_id: number | null; dirty: number }>();
+  const digestsByKind = new Map<boolean, Awaited<ReturnType<typeof feedbackDigests>>>();
   for (const row of rows.results) {
     const event = (await env.DB.prepare("SELECT * FROM cloud_events WHERE id=?").bind(row.event_id).first<TaskEvent>())!;
     if (event.action === "list") {
@@ -91,19 +121,22 @@ export async function flushFeedback(env: Env) {
       if (digest.message_id === null || digest.dirty) continue;
     }
     const ids: number[] = JSON.parse(event.task_ids);
-    const relevant = digests.results.filter(digest => JSON.parse(digest.task_ids_json).some((id: number) => ids.includes(id)));
+    const information = event.action === "read_information";
+    if (!digestsByKind.has(information)) digestsByKind.set(information, await feedbackDigests(env, information));
+    const relevant = digestsByKind.get(information)!.filter(digest => digest.ids.some(id => ids.includes(id)));
     // Do not delete a command before all of today's targeted digests are current.
     if (relevant.some(digest => digest.message_id !== null && digest.dirty)) continue;
-    const covered = new Set(relevant.filter(digest => digest.message_id !== null).flatMap(digest => JSON.parse(digest.task_ids_json) as number[]));
+    const covered = new Set(relevant.filter(digest => digest.message_id !== null).flatMap(digest => digest.ids));
     try {
       if (row.allow_fallback && !row.fallback_sent && ids.some(id => !covered.has(id))) {
-        const { tasks } = await effectiveStates(env);
+        const tasks = information ? new Map<number, TaskState>() : (await effectiveStates(env)).tasks;
         const groups = new Map<string, number[]>();
         for (const id of ids) {
-          const status = tasks.get(id)?.status ?? "unavailable";
+          const status = information ? JSON.parse(event.completed_ids).includes(id) ? "read" : event.status
+            : tasks.get(id)?.status ?? "unavailable";
           groups.set(status, [...(groups.get(status) ?? []), id]);
         }
-        const text = `${feedbackLabel(event)}\n${[...groups].map(([status, values]) => `${escapeHtml(status)}: ${values.map(id => `#${id}`).join(", ")}`).join("\n")}`;
+        const text = `${feedbackLabel(event)}\n${[...groups].map(([status, values]) => `${escapeHtml(status)}: ${values.map(id => `#${information ? "i" : ""}${id}`).join(", ")}`).join("\n")}`;
         await telegramRequest(env, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML" });
         await env.DB.prepare("UPDATE cloud_task_feedback SET fallback_sent=1 WHERE id=?").bind(row.id).run();
       }

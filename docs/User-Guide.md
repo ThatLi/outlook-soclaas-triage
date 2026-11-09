@@ -414,6 +414,12 @@ keep their original window.
 - `/read #i42` marks the original email read in Outlook and removes it from future briefs after confirmation.
 - `/read #i42 #i43` processes multiple informational emails. Send task references such as `#42` in a separate command.
 
+In cloud mode, informational reads show progress inside the current digest and
+remove the entries after Outlook confirms success. Separate queued/marked replies
+are suppressed when a current editable digest covers the emails. Accepted commands
+are cleaned up after feedback is visible; failures and `/show` content remain.
+Without a covering digest, the bot sends a concise fallback with the `#i` references.
+
 Reading an email directly in Outlook removes it after the next successful read-state
 synchronization. Entries expire 72 hours after receipt. Unknown read states remain
 hidden until checked; a failed refresh retains the last confirmed state and shows

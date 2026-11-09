@@ -6,7 +6,7 @@ interface Fragment { summary?: string; html: string }
 
 // Only renderer-owned HTML enters this packer; mailbox strings are escaped first.
 export function renderRichDigest(data: BridgeSnapshot | null, now = new Date(), fixedGroups?: DigestGroup[],
-  annotations = new Map<number, string>(), feedback = "", news?: string, frozenInformation = false): string[] {
+  annotations = new Map<number, string>(), feedback = "", news?: string, frozenInformation = false, informationAnnotations = new Map<number, string>()): string[] {
   const today = singaporeClock(now).date;
   const fragments: Fragment[] = [];
   const paragraph = (html: string, summary?: string) => fragments.push({ summary, html: `<p>${html.replaceAll("\n", "<br>")}</p>` });
@@ -32,7 +32,7 @@ export function renderRichDigest(data: BridgeSnapshot | null, now = new Date(), 
     const informationHeading = "ℹ️ <b>INFORMATIONAL EMAILS · LAST 72 HOURS</b>";
     if (!information.length) paragraph("No unread informational emails.", informationHeading);
     for (const item of information) {
-      for (const part of informationParts(item)) paragraph(part, informationHeading);
+      for (const part of informationParts(item, informationAnnotations.get(item.id))) paragraph(part, informationHeading);
     }
     for (const [label, key] of [["Informational", "information_count"], ["Newsletters", "newsletter_count"],
       ["Automated", "automated_count"], ["Explicitly skipped", "skipped_count"]]) {

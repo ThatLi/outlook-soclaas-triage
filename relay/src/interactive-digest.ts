@@ -2,7 +2,7 @@ import type { Env } from "./index";
 import { digestTaskGroups, renderDigest, seal, snapshot, unseal, informationalEmails } from "./cloud";
 import { singaporeClock } from "./index";
 import { TelegramFailure, telegramRequest } from "./telegram-api";
-import { annotation, digestGroups, effectiveStates, feedbackLabel, type DigestGroup, type TaskEvent } from "./task-feedback";
+import { annotation, informationAnnotation, digestGroups, effectiveStates, feedbackLabel, type DigestGroup, type TaskEvent } from "./task-feedback";
 import type { BridgeSnapshot, CloudTask, InformationEmail } from "./cloud";
 import { fetchNews } from "./news";
 import { renderRichDigest } from "./rich-digest";
@@ -90,6 +90,7 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
   let richData: BridgeSnapshot | null = null;
   let richGroups: DigestGroup[] | undefined;
   let richNotes = new Map<number, string>();
+  let informationNotes = new Map<number, string>();
   if (row.dirty && row.digest_date === singaporeClock(now).date) {
     const data = await snapshot(env);
     if (data) {
@@ -106,13 +107,14 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
       const latestInformation = new Map((data.information ?? []).map(item => [item.id, item]));
       const information = (layout.information ?? []).map(item => ({ ...item,
         is_read: latestInformation.get(item.id)?.is_read ?? item.is_read }));
+      informationNotes = new Map(information.map(item => [item.id, informationAnnotation(item.id, events)]));
       if (information.some((item, index) => item.is_read !== layout.information![index].is_read)) {
         await env.DB.prepare("UPDATE interactive_digests SET sealed_layout=? WHERE id=?")
           .bind(await seal(env, row.id, [JSON.stringify({ ...layout, information })]), row.id).run();
       }
       if (row.format === "rich") {
         richData = { ...data, tasks: updated, information }; richGroups = layout.groups; richNotes = notes;
-      } else pages = renderDigest({ ...data, tasks: updated, information }, now, layout.groups, notes, true);
+      } else pages = renderDigest({ ...data, tasks: updated, information }, now, layout.groups, notes, true, informationNotes);
     }
   }
   const event = row.feedback_event === null || row.digest_date !== singaporeClock(now).date ? null
@@ -121,7 +123,7 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
   const news = row.sealed_news ? (await unseal(env, row.id, row.sealed_news))[0] : undefined;
   if (row.format === "rich") {
     // Older editions retry their encrypted, frozen rendering instead of using today's snapshot.
-    if (richData) pages = renderRichDigest(richData, new Date(`${row.digest_date}T00:00:00+08:00`), richGroups, richNotes, feedback, news, true);
+    if (richData) pages = renderRichDigest(richData, new Date(`${row.digest_date}T00:00:00+08:00`), richGroups, richNotes, feedback, news, true, informationNotes);
     await env.DB.prepare("UPDATE interactive_digests SET sealed_pages=?,feedback_text=? WHERE id=?")
       .bind(await seal(env, row.id, pages), feedback, row.id).run();
     return deliverRichDigest(env, row, pages);
