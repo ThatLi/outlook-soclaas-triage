@@ -485,6 +485,16 @@ class TelegramClient:
             chats[chat_id] = TelegramChat(chat_id, name, "private")
         return list(chats.values())
 
+    def identity(self) -> dict[str, Any]:
+        return self._request("getMe")
+
+    def private_chat(self) -> TelegramChat:
+        result = self._request("getChat", {"chat_id": self.chat_id})
+        if not isinstance(result, dict) or result.get("type") != "private":
+            raise TelegramError("The configured destination must be a private chat", category="configuration")
+        name = str(result.get("first_name") or result.get("username") or "Private chat")
+        return TelegramChat(str(result["id"]), name, "private")
+
     def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, Any]]:
         data: dict[str, Any] = {
             "timeout": max(0, timeout),

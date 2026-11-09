@@ -1,4 +1,7 @@
-# Cloud Telegram bot with a Windows Outlook bridge
+# Advanced: existing cloud bot and Windows bridge
+
+For a first installation, use [local Setup](User-Guide.md). Cloud resources must be created and maintained separately by an experienced owner; the installer creates none. Setup can connect an existing deployment using its HTTPS URL and independent secrets. It never changes a webhook, publishes a snapshot, or assumes dataset ownership. Original preview caching is off.
+
 
 This mode needs no Entra registration, Power Automate, or paid hosting. Cloudflare
 receives all Telegram commands and owns task states. Windows connects outbound to
@@ -61,7 +64,7 @@ Unchanged parts do not trigger a Telegram edit. Successful parts are checkpointe
 individually; failed continuations resume without resending completed parts.
 Surplus continuations are removed only after replacement content succeeds.
 
-### Quiet task feedback (PR #13)
+### Quiet task feedback
 
 `/done`, `/dismiss`, `/waiting`, `/reopen`, and `/read` show feedback in today's
 interactive digests. Accepted task commands are deleted only after feedback is
@@ -93,31 +96,6 @@ Command deletion is best effort: commands older than 48 hours and permanently
 rejected deletions are skipped without undoing the action. Transient failures and
 Telegram retry delays preserve pending feedback and cleanup for retry.
 
-For the interactive-digest upgrade, apply migration `0003_interactive_digests.sql`
-with `npx wrangler d1 migrations apply outlook-triage-relay --remote` before
-deploying the Worker. Run `outlook-triage cloud-webhook-enable` with the updated
-Python installation to preserve message updates and enable `callback_query`
-updates without discarding pending updates. Existing queued chunk deliveries
-retain their progress. The old sample navigation-trial buttons are retired.
-The migration is additive; retain the new tables when rolling back the Worker.
-For the faster-update upgrade, also apply `0004_digest_payload_hash.sql`, deploy
-the updated Worker, and restart Cloud Bridge to load the five-second interval.
-For restored quiet task feedback, apply `0005_quiet_task_feedback.sql` before
-deploying. The original `0003_digest_interactions.sql` migration from PR #13 is
-retained for installations that already applied it. Existing interactive messages
-acquire their retained layout on first refresh; rows removed before this upgrade
-cannot have their original membership reconstructed. No bridge change is needed.
-
-For expandable rich digests, apply `0008_rich_digests.sql` before deploying the
-updated Worker. Existing records default to the legacy format; new editions use
-rich sections. Keep the additive schema when rolling back. No new dependency,
-setting, or Python bridge change is required. Before rollout, inspect a sample on
-your daily Telegram clients and confirm expanding sections produces no callback
-requests. Automated tests cannot establish client rendering or expansion behavior.
-For temporary `/list` acknowledgement cleanup, apply `0006_list_reply_cleanup.sql`
-before deployment. Only newly sent tracked notices can be deleted automatically;
-previously untracked notice IDs cannot be recovered. Telegram's deletion age
-limit and best-effort cleanup rules also apply to these notices.
 
 ## Daily news trial
 
@@ -178,62 +156,20 @@ errors. Evaluate relevance, empty editions, and source reliability before adding
 other publishers or AI summaries. Automated tests do not establish production
 free-tier CPU headroom or live Telegram delivery.
 
-## Cutover
+## Connecting an existing deployment
 
-The current deployment uses **https://noelle-outlook-triage-bot.pages.dev** for
-HTTP requests because the original workers.dev address does not resolve on this
-network. Pages only forwards requests through a `BOT` service binding to
-`outlook-triage-relay`. All secrets, database access, command handling, and Cron
-remain in that original Worker; Pages stores no copy of the credentials.
+The owner must already have a Worker, D1 schema through migration 0008, Telegram bot/private chat, independent relay bearer token, 32-byte encryption key, and independent webhook secret. Use the owner's approved HTTPS ingress. No shared public deployment is supplied. This repository's developer deployment configuration is not your deployment configuration; never reuse another person's database ID, address, bot or credentials.
 
-To deploy this alternative ingress, run from `relay/pages/`:
+For a new advanced deployment, the [outbound relay guide](Cloud-Relay.md) describes resource creation separately. The current Worker defaults to cloud bot mode and Cron every minute. Configure `CLOUD_BOT_ENABLED=true` for this mode and apply all migrations, then provide the additional `TELEGRAM_WEBHOOK_SECRET`. No automatic provisioning/template is provided by the installer. Match the ingress used for Windows requests and `/telegram/webhook`; an optional Pages service binding must point to the owner's Worker. Never copy personal ingress names from another deployment.
 
-```powershell
-npx wrangler pages project create noelle-outlook-triage-bot --production-branch main
-npx wrangler pages deploy public --project-name noelle-outlook-triage-bot --branch main --commit-dirty=true
-```
+1. Keep local writers/listeners stopped while confirming ownership. The same SQLite database's stable bridge dataset ID must match the deployed snapshot. Preserve both SQLite and cloud D1; do not delete/recreate a database to bypass an ownership conflict. A fresh local dataset cannot safely replace someone else's cloud task state.
+2. In Setup choose **Advanced: connect an existing cloud bot**. Enter the owner's HTTPS URL and secrets through hidden fields. Setup verifies the cloud flag and webhook-secret fingerprint using a read-only GET. It cannot verify the remote encryption key, Telegram bot/chat match or dataset by that GET; confirm these with the owner before proceeding.
+3. Setup validates your bot and requires an explicit private-chat confirmation. With an existing webhook, it does not call `getUpdates`; enter the existing private chat ID through hidden input. The webhook must already match the configured ingress plus `/telegram/webhook`. If it is not configured yet, exit Setup and have the owner complete step 4. Do not silently replace another receiver.
+4. Advanced owner action only: `outlook-triage cloud-webhook-enable` verifies the bridge dataset through existing bridge logic, checks the independent webhook secret, configures Telegram's command menu and confirms its webhook without dropping pending updates. For a genuinely new, owner-approved empty deployment, initialize/publish the correct local dataset with existing `bridge-poll` after explicitly approving real mailbox processing; this can read and classify email. Never use it as a beginner connection test or against an unconfirmed existing dataset.
+5. Complete Setup and **First-run Check** before enabling background operation. This uses fictional classification plus confirmed harmless Telegram delivery. The background bridge runs windowlessly, under the interactive Windows user, at logon and immediately after final guided consent. It disables the same installation's opposite-mode tasks, without touching foreign installations. Keep other foreground listeners/writers stopped.
+6. Test `/status` and `/tasks`, confirm fresh bridge timestamps, and compare cloud task state with the owner. Use `/list` only after approving real mailbox processing. Mailbox changes wait for the bridge; cloud task management remains available while Windows is off.
 
-Create the project only once. Set the local `OUTLOOK_TRIAGE_RELAY_URL` to the Pages
-address, and use that same address for the Telegram webhook. The Worker Cron
-continues to work without a publicly resolvable workers.dev route. Pages Functions
-share the Workers Free request allowance; no paid subscription is introduced.
-
-Complete the original [relay setup](Cloud-Relay.md) first. Keep Workers on the Free
-plan. D1 is the durable command queue and encrypted response outbox; no separate
-queue service is needed.
-
-1. Stop local writers and back up SQLite. Preserve its new `bridge_state` and
-   `bridge_receipts` tables in subsequent backups. The stable dataset ID binds
-   this database to the cloud and prevents task ID collisions with another database.
-2. In `relay/`, run `npm ci`, `npm run typecheck`, and `npm test`, then apply:
-
-   ```powershell
-   npx wrangler d1 migrations apply outlook-triage-relay --remote
-   ```
-
-3. Generate an independent random secret with at least 32 URL-safe characters.
-   Store it in your password manager and add it with
-   `npx wrangler secret put TELEGRAM_WEBHOOK_SECRET`. Do not reuse existing tokens.
-   Optionally store the same `TELEGRAM_WEBHOOK_SECRET` in local `secrets.env` to
-   enable unattended webhook setup; otherwise the command prompts for it.
-4. Set `CLOUD_BOT_ENABLED` to `"true"` in `relay/wrangler.jsonc`, then deploy with
-   `npx wrangler deploy`. The flag selects exactly one digest sender: old relay or
-   cloud bot.
-5. Add `OUTLOOK_TRIAGE_CLOUD_BOT=true` to local `secrets.env`. Keep the existing
-   relay URL, token, and encryption key. Local CLI mutations, Telegram delivery,
-   polling, and legacy sync commands now refuse to bypass cloud ownership.
-6. From the project root, preview `scripts/register_cloud_bridge.ps1 -ShowPlan`,
-   then run it without `-ShowPlan`. It stops/disables this installation's legacy
-   Sync, Digest, and Telegram Commands tasks, registers Cloud Bridge at logon, and
-   starts it. Stop any separate foreground listeners or sync processes too.
-   The initial publication imports existing classifications and task numbers.
-   Connectivity and webhook-secret checks run before any schedule changes. The
-   background task uses `pythonw.exe`, so no console window needs to stay open.
-7. Run `outlook-triage cloud-webhook-enable`. It verifies bridge connectivity,
-   prompts for the hidden secret from step 3, installs the cloud command menu,
-   and verifies the webhook URL. Pending Telegram updates are preserved.
-8. Test `/status`, `/tasks`, `/waiting`, and `/reopen`. Verify that subsequent
-   bridge uploads preserve cloud changes. Test `/read` on a non-sensitive message.
+Advanced source scheduling uses `scripts/register_cloud_bridge.ps1 -ShowPlan`, then the same script without `-ShowPlan` after First-run Check. Registration alone starts at the next logon; the guided flow explicitly starts the listener. `-CachePreviews` remains an explicit advanced opt-in. Installed users should use the Start shortcuts.
 
 ### Optional cached body previews
 
@@ -293,10 +229,9 @@ For acceptance, keep Windows off for 48 hours and exercise cloud commands, queue
 mailbox commands, and both morning digests. Reconnect and verify queued changes
 and completion replies against Outlook. Automated tests do not replace this test.
 
-For rollback, first let the bridge drain commands and mirror cloud task changes
+For an intentional return to local mode, first let the bridge drain commands and mirror cloud task changes
 into SQLite. Stop/disable Cloud Bridge, run `cloud-webhook-disable`, set the local
-cloud setting to false, set the Worker flag to false and redeploy. Re-enable the
-original Windows schedules and run `relay-publish`. If Windows cannot reconnect,
+cloud setting to false, set the Worker flag to false and redeploy. For purely local operation, the owner must also clear all three saved relay connection values after preserving a private backup. Reopen Setup, confirm local mode, complete First-run Check and enable local schedules. If retaining the legacy outbound relay instead, use the advanced scheduler and `relay-publish`. If Windows cannot reconnect,
 preserve cloud D1 first: newer edits and pending work are not yet in local SQLite.
 ## Informational digest support
 

@@ -1,10 +1,10 @@
-# Cloudflare Telegram Relay
+# Advanced: legacy outbound Cloudflare relay
 
 For two-way commands and cloud task state, use the
 [Cloud Bot and Outlook Bridge guide](Cloud-Bot.md). `CLOUD_BOT_ENABLED` selects
 one mode; only the selected mode sends scheduled digests.
 
-This optional phase-one relay sends the newest digest prepared on Windows at 08:00 Asia/Singapore even if Windows is then off. It does not access Outlook, classify messages, receive Telegram commands, or make cloud state authoritative.
+Local operation is recommended for new users. This optional one-way relay sends the newest digest prepared on Windows at 08:00 Asia/Singapore even if Windows is then off. It does not access Outlook, classify messages, receive Telegram commands, or make cloud state authoritative.
 
 The local application formats the digest and future cached command views, encrypts the complete payload with AES-256-GCM, and uploads only ciphertext plus routing timestamps. Cloudflare decrypts the frozen bundle only when sending it to Telegram. D1 retains the newest bundle indefinitely, removes superseded unreferenced bundles after seven days, and removes completed delivery records after 30 days.
 
@@ -31,7 +31,7 @@ npx wrangler login
 npx wrangler d1 create outlook-triage-relay
 ```
 
-Copy the returned database ID into `relay\wrangler.jsonc`, replacing `REPLACE_WITH_D1_DATABASE_ID`. Apply the schema:
+The checked-in configuration may contain a developer deployment ID; never use it for a new installation. Copy your own returned database ID into `relay\wrangler.jsonc`, replacing any existing ID. For this legacy one-way mode explicitly set `CLOUD_BOT_ENABLED` to `"false"`; the current source default is the two-way cloud bot. Apply the schema:
 
 ```powershell
 npx wrangler d1 migrations apply outlook-triage-relay --remote
@@ -56,7 +56,7 @@ npm test
 npx wrangler deploy
 ```
 
-Cloudflare Cron invokes the Worker every 30 minutes. Before 08:00 Singapore time it exits without creating a delivery. At or after 08:00 it freezes that day's newest bundle and sends at most 20 messages per invocation until complete.
+The current checked-in Cron invokes the Worker every minute. Older deployments may use a different interval; verify your own configuration. Before 08:00 Singapore time it exits without creating a delivery. At or after 08:00 it freezes that day's newest bundle and sends at most 20 messages per invocation until complete.
 
 ## 3. Configure Windows
 
@@ -95,7 +95,7 @@ Afterward, each completed `sync` and `retry-failed` prepares a newer bundle auto
 - **Bearer-token rotation:** run `npx wrangler secret put RELAY_TOKEN`, update the local value, then run `relay-publish`.
 - **Encryption-key rotation:** update the Worker secret and local value together. Existing bundles become unreadable, so immediately publish a new bundle. A delivery frozen before rotation cannot resume; inspect D1 and remove that pending delivery before retrying.
 - **Telegram-token rotation:** update both the local secrets file and `TELEGRAM_BOT_TOKEN` Worker secret.
-- **Permanent Telegram rejection:** correct the bot/chat secrets. The next 30-minute Cron attempt resumes from the recorded chunk.
+- **Permanent Telegram rejection:** correct the bot/chat secrets. The next configured Cron attempt resumes from the recorded chunk.
 - **Lost local outbox:** `relay-publish` recreates it from the current SQLite database.
 - **Lost D1 database:** recreate it, apply migrations, redeploy, and run `relay-publish`.
 

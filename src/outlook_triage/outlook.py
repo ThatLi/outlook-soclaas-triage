@@ -93,6 +93,13 @@ class OutlookClient:
         self.application = None
         self._co_uninitialize()
 
+    def profile_metadata(self) -> dict[str, str]:
+        """Identify the actual connected profile and Inbox store, without items."""
+        return {
+            "profile": str(self.namespace.CurrentProfileName),
+            "mailbox": str(self.inbox.Store.DisplayName),
+        }
+
     @staticmethod
     def _translate_error(operation: str, exc: Exception) -> OutlookError:
         detail = str(exc)

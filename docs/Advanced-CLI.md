@@ -1,0 +1,393 @@
+# Advanced command-line reference
+
+The commands below describe local mode. For cloud commands and queued mailbox
+operations, follow the [Cloud Bot and Outlook Bridge guide](Cloud-Bot.md).
+
+This guide is the reference for operating Outlook–SoCLaaS Triage after installation. Complete [Setup and First-run Check](User-Guide.md) or the [source installation checks](Source-Installation.md) before using these commands or registering scheduled tasks.
+
+The supported user interfaces are the `outlook-triage` command-line program and `scripts\register_windows_tasks.ps1`. The application does not expose a public HTTP API or a stable Python SDK. Python modules and other scripts in the repository are internal implementation details.
+
+## Command basics
+
+Run commands from PowerShell after activating the project virtual environment:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+outlook-triage --help
+```
+
+Use `--help` after a command to see its syntax. `--verbose` is a global option and must appear before the command; it enables detailed console logging in addition to the rotating application log.
+
+```powershell
+outlook-triage sync --help
+outlook-triage --verbose sync
+```
+
+Unless a command says otherwise, it loads configuration from `%APPDATA%\OutlookTriage\secrets.env`, uses the signed-in classic Outlook profile, and writes application state under `%LOCALAPPDATA%\OutlookTriage`.
+
+## Recommended workflow
+
+After the README safety checks, run two manual synchronizations and inspect the resulting digest before enabling a schedule:
+
+```powershell
+outlook-triage sync
+outlook-triage sync
+outlook-triage digest
+outlook-triage tasks list
+```
+
+The first synchronization scans the configured bootstrap period. Later runs rescan an overlap window and deduplicate messages, so repeating `sync` is safe. Resolve any failed classifications with `retry-failed`, manage generated tasks locally, and generate a fresh digest as needed.
+
+## CLI reference
+
+### `init`
+
+```powershell
+outlook-triage init
+```
+
+Creates the configuration templates and runtime directories and initializes the SQLite database. Existing configuration files are never overwritten. It prints the files it created and the database location.
+
+Run this once after installation. It is also safe to run again to create any missing template or directory.
+
+### `models`
+
+```powershell
+outlook-triage models
+```
+
+Calls the configured SoCLaaS service and prints the model IDs available to `SOCLAAS_API_KEY`, including a context size when the service provides one. Copy the exact chosen ID into `EMAIL_TRIAGE_MODEL`.
+
+This command requires `SOCLAAS_API_KEY` and a reachable `SOCLAAS_BASE_URL`; it does not require `EMAIL_TRIAGE_MODEL` to be set.
+
+### `check-mail`
+
+```powershell
+outlook-triage check-mail
+outlook-triage check-mail --limit 25
+```
+
+Prints the received time, sender, subject, and Outlook `EntryID` for the newest messages. The default limit is 10.
+
+This is a metadata-only safety check: it does not read message bodies, call SoCLaaS, apply synchronization eligibility rules, or write message records to the database. It requires classic Outlook and the selected profile to be available.
+
+### `classify-one`
+
+```powershell
+outlook-triage classify-one "OUTLOOK_ENTRY_ID"
+```
+
+Fetches the selected Outlook item, cleans and truncates its body, verifies the configured model, and asks SoCLaaS to classify it. The resulting structured JSON includes action status, urgency, action type, task text, deadline information, summary, category, reason, and confidence.
+
+The classification is printed but is not saved. This command may read sensitive message content and send the cleaned content to SoCLaaS. Use a non-sensitive message for initial validation, and run `sync` when results should be persisted.
+
+### `sync`
+
+```powershell
+outlook-triage sync
+```
+
+Scans classic Outlook, stores message metadata, applies explicit filters, classifies eligible messages with SoCLaaS, and creates local tasks for messages requiring action. It prints counts in this form:
+
+```text
+processed=3 skipped=1 failed=0 unchanged=4 relay_pending=0
+```
+
+`relay_pending` is `0` when the optional relay is disabled or its newest encrypted snapshot was confirmed, and `1` when relay configuration or upload needs attention. It does not change the synchronization exit status.
+
+On the first run, the scan begins `OUTLOOK_TRIAGE_BOOTSTRAP_DAYS` before the current time. Later runs begin before the stored high-water timestamp by `OUTLOOK_TRIAGE_OVERLAP_HOURS`. Messages are deduplicated by Outlook store ID and `EntryID`.
+
+Within the scan window, only unread messages or messages with an active Outlook follow-up flag are eligible. Read messages without an active flag, including completed flags, are skipped without reading their bodies. Pinned messages are not included unless they are unread or actively flagged because the documented classic Outlook object model does not expose pin state.
+
+The command does not change any Outlook item. Metadata and the high-water timestamp are committed before classification, so an interrupted or partially failed classification run does not lose discovered messages. A process lock prevents overlapping synchronization and retry runs.
+
+### `retry-failed`
+
+```powershell
+outlook-triage retry-failed
+outlook-triage retry-failed --limit 100
+```
+
+Retries locally pending or failed messages, oldest first, by refetching them from Outlook and applying the current filters and SoCLaaS configuration. The default limit is 50. It prints the same count fields as `sync` and shares the synchronization process lock.
+
+Use this after correcting connectivity, credentials, model selection, or invalid model output. A message that no longer exists or remains inaccessible stays failed for a later retry.
+
+### `digest`
+
+```powershell
+outlook-triage digest
+outlook-triage digest --telegram
+```
+
+Without `--telegram`, builds the current deterministic Markdown digest from the local database, prints it, and saves it as `%LOCALAPPDATA%\OutlookTriage\reports\YYYY-MM-DD.md`. It never sends the digest externally.
+
+The digest shows synchronization health, pending classification warnings, overdue tasks, urgent or due-today tasks, tasks due within `OUTLOOK_TRIAGE_DIGEST_HORIZON_DAYS`, other open actions, waiting items, and 24-hour category counts. Running it again on the same day replaces that day's local report with a current snapshot.
+
+With `--telegram`, the command saves the local report, freezes formatted Telegram messages in the SQLite outbox, and then attempts delivery. If an active delivery for the same date already exists, it resumes that frozen delivery instead of regenerating the report. See [Telegram delivery](#telegram-delivery) for recovery and privacy behavior.
+
+### `tasks`
+
+Task commands change only the local SQLite database. They never update flags, categories, or other state in Outlook.
+
+List all tasks or filter by one supported status:
+
+```powershell
+outlook-triage tasks list
+outlook-triage tasks list --status open
+outlook-triage tasks list --status waiting
+outlook-triage tasks list --status done
+outlook-triage tasks list --status dismissed
+```
+
+Each row shows its numeric ID, status, urgency, description, and deadline. Use that numeric ID with an update command:
+
+| Command | Resulting status | Example |
+| --- | --- | --- |
+| `tasks done TASK_ID` | `done` | `outlook-triage tasks done 12` |
+| `tasks waiting TASK_ID` | `waiting` | `outlook-triage tasks waiting 15` |
+| `tasks dismiss TASK_ID` | `dismissed` | `outlook-triage tasks dismiss 18` |
+| `tasks reopen TASK_ID` | `open` | `outlook-triage tasks reopen 12` |
+
+An unknown task ID reports an error and makes no change. A later digest reflects the current local status.
+
+### `telegram-chats`
+
+```powershell
+outlook-triage telegram-chats
+```
+
+Lists recent private chats visible to the configured bot as a chat ID and display name. It ignores groups and requires `TELEGRAM_BOT_TOKEN`, but not `TELEGRAM_CHAT_ID`.
+
+First open the bot's private chat in Telegram and send `/start`. Then run this command and place the intended numeric ID in `TELEGRAM_CHAT_ID`. If there are no recent private chats, the command explains how to start one and exits unsuccessfully.
+
+### `telegram-test`
+
+```powershell
+outlook-triage telegram-test
+```
+
+Sends a fixed, harmless configuration-success message to the configured private chat. It requires both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; it does not include Outlook or task data.
+
+### `telegram-retry`
+
+```powershell
+outlook-triage telegram-retry
+```
+
+Reactivates queued deliveries that were paused for attention and tries the Telegram outbox again. Use it only after correcting the reported credential, chat, access, or content problem. The summary reports how many deliveries were reactivated, completed, still need attention, or expired.
+
+The command resumes stored message chunks; it does not regenerate their Markdown reports. Queued deliveries are processed oldest first.
+
+### `telegram-poll`
+
+```powershell
+outlook-triage telegram-poll
+```
+
+Checks once for inbound commands, processes them in update order, prints the number completed, and exits. Use this for setup and diagnostics. It requires both Telegram settings and refuses to run while a Telegram webhook is configured or another receiver is active.
+
+### `telegram-listen`
+
+```powershell
+outlook-triage telegram-listen
+```
+
+Runs a foreground long-polling listener until interrupted. It uses outbound HTTPS only and does not expose a local HTTP server. Transient Telegram failures use bounded backoff. Run only one listener; a receiver lock prevents this command, `telegram-poll`, and `telegram-chats` from consuming updates concurrently. At startup, the listener registers the supported commands in Telegram's bot command menu.
+
+The configured private chat supports:
+
+| Command | Behavior |
+| --- | --- |
+| `/list` | Immediately acknowledges the request, synchronizes Outlook and runs classification, reports counts, then sends a freshly generated digest from current SQLite state. It does not save a report or create/reuse a Telegram outbox delivery. If some classifications fail, it still sends the counts, warning, and available digest. |
+| `/sync` | Immediately acknowledges the request, synchronizes Outlook and runs classification, then reports counts without sending a digest. |
+| `/retry` or `/retry 25` | Immediately acknowledges the request and retries up to 50, or the specified 1–100, pending or failed classifications. |
+| `/status` | Shows the last successful sync, latest run state, pending/failed classification count, and task counts by status from SQLite without contacting Outlook. |
+| `/tasks`, `/tasks open`, `/tasks waiting`, `/tasks done`, `/tasks dismissed`, or `/tasks all` | Lists escaped, bounded task messages from SQLite. The default is `all`; Outlook is not contacted. |
+| `/read #42` or `/read #42 #51 68` | Marks one or more tasks' original Outlook emails read. IDs are deduplicated, every ID is validated before any email changes, and local task statuses remain unchanged. Repeating the command is safe. |
+| `/done #42` or `/done #42 #51 68` | Marks each original email read and then sets each local task to `done`. |
+| `/dismiss #42` or `/dismiss #42 #51 68` | Marks each original email read and then sets each local task to `dismissed`. |
+| `/waiting #42` or `/waiting #42 #51 68` | Sets each local task to `waiting` without changing Outlook read state. |
+| `/reopen #42` or `/reopen #42 #51 68` | Sets each local task to `open` without changing Outlook read state. |
+| `/show #42` | Sends a bounded, escaped plain-text body preview without changing Outlook read state. Attachment contents are never read. |
+| `/help` or `/start` | Shows the available commands. |
+
+Task IDs are the numeric IDs shown in the digest and task lists. Batch commands deduplicate IDs and validate the entire list before making changes. For `/done` and `/dismiss`, each local status changes only after that task's Outlook email is successfully marked read; successfully completed earlier items remain changed if a later Outlook operation fails. `/waiting` and `/reopen` are idempotent local-only transitions. The bot reports validation, lock, configuration, Outlook, SoCLaaS, database, and other operational failures with sanitized retry guidance.
+
+Commands from other chats and bot-authored messages are ignored. `/list`, `/sync`, and `/retry` occupy the listener while they run, so their immediate acknowledgement confirms that work started. Outlook operations share the synchronization lock, preventing concurrent Outlook access. An update is recorded as applied before its final response is sent; if Telegram delivery fails, retrying the update sends a safe response without repeating synchronization, classification, or task mutations.
+
+`/list` always means synchronize first and then generate a live digest. Use `/tasks` or `/status` for a fast database-only view. Tasks in `done` or `dismissed` state are omitted from subsequent digests; marking an email read with `/read` alone does not change its local task or remove it from the digest.
+
+Installation, credentials, model selection, `init`, `models`, `check-mail`, `classify-one`, Telegram setup/recovery, raw Outlook-ID diagnostics, and Windows Task Scheduler registration remain local-only administration. The Telegram interface is for daily operations, not remote host administration.
+
+## Telegram delivery
+
+Telegram is optional. To enable it:
+
+1. Use the verified **@BotFather** in Telegram, create a bot with `/newbot`, and keep the token private.
+2. Open a private chat with the bot and send `/start`.
+3. Set `TELEGRAM_BOT_TOKEN` in `%APPDATA%\OutlookTriage\secrets.env`.
+4. Run `outlook-triage telegram-chats` and set the intended `TELEGRAM_CHAT_ID`.
+5. Run `outlook-triage telegram-test`.
+6. Send a real digest with `outlook-triage digest --telegram`.
+
+The delivered digest begins with a summary and sends non-empty task sections as compact checklists. Long content is HTML-escaped and split into ordered messages. Confirmed chunks are recorded and are not deliberately resent. Telegram has no request idempotency key, so a chunk may appear twice if Telegram accepted it but the network failed before acknowledging it.
+
+Transient network, rate-limit, and Telegram server failures leave the delivery pending and return an error so a Telegram-enabled scheduled task can retry. A resumed delivery starts with a delayed-delivery notice. Invalid credentials, an inaccessible or blocked chat, and permanent content rejection pause affected deliveries and request user attention instead of repeatedly retrying. On Windows, the application attempts to show a tray warning. Correct the problem and run `outlook-triage telegram-retry`.
+
+Queued messages are retained in SQLite for up to seven days and then expire; the local Markdown report remains available. The bot token, Telegram response bodies, and digest contents are not written to application logs.
+
+Telegram digest delivery receives summaries, task descriptions, sender information, and deadlines. The `/show` command additionally transmits up to `TELEGRAM_BODY_PREVIEW_CHARS` characters of the original plain-text body. Do not enable these features unless your organization permits that information to be sent to Telegram.
+
+## Optional cloud and scheduling
+
+Local operation is recommended. For existing cloud deployments see [Advanced Cloud](Cloud-Bot.md); for the legacy one-way mode see [Outbound relay](Cloud-Relay.md).
+
+Guided commands are `setup`, read-only `doctor`, and the separate fictional first-run test `verify`. Add `--pause` for a shortcut-style window that waits before closing. `doctor --pause` offers a sanitized report. Exit codes are in [Troubleshooting](Troubleshooting.md).
+
+`background plan` prints JSON without accessing Task Scheduler or settings. Installed tasks run `outlook-triage-background.exe`; development tasks run `.venv/Scripts/pythonw.exe -m outlook_triage`. Paths containing spaces/non-ASCII characters are passed directly to Task Scheduler. The default task prefix contains an installation-path identifier. Task ownership requires both executable and working-directory matches. Registration refuses a foreign task collision. Only this installation's tasks are stopped or removed.
+
+```powershell
+outlook-triage background plan --telegram --listener
+outlook-triage background status --telegram --listener
+outlook-triage background stop
+```
+
+Use `verify` to consent to processing and enable background operation. Advanced `background enable --telegram --listener` requires passing connection checks and the saved First-run Check for these settings. `--cloud` selects the matching configured cloud mode. `--project-dir` selects an executable directory; `--task-prefix` scopes advanced task names. Remove custom prefixes explicitly with `background stop --task-prefix 'Your prefix'` before uninstall. The installer cannot remove arbitrarily named tasks. Configuration/data path overrides must also exist in the scheduled user's environment; prefer defaults for installed use. No secret is placed in a scheduled command argument.
+
+The source scripts retain `-ProjectDir`, `-TaskPrefix`, `-ShowPlan`, `-EnableTelegram`, `-EnableTelegramCommands`, and cloud `-CachePreviews`. They delegate to the same scheduler. Registration does not start tasks immediately; the guided First-run Check also starts listeners after explicit consent. Registration checks all same-prefix names before changes and disables the opposite mode's owned tasks. Stop separately launched foreground processes before switching modes.
+
+Local sync triggers are 03:50, 07:50, 11:50, 15:50, 19:50 and 23:50; digest is 08:00, all **Windows local time**, independently of report timezone (default Asia/Singapore). Tasks use the interactive user's limited token, start missed timed work when available, do not wake the computer and use IgnoreNew. Sync/digest time out after two hours; listeners have no execution-time limit and restart after failure. The cloud bridge's own four-hour slots and cloud Cron use Asia/Singapore. See [User Guide](User-Guide.md) for sleep/lock/sign-out behavior.
+
+## Configuration and local data
+
+Values in the process environment override values read from `secrets.env`. Blank values are treated as unset.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `SOCLAAS_API_KEY` | unset | SoCLaaS credential. |
+| `SOCLAAS_BASE_URL` | `https://soclaas-api.comp.nus.edu.sg/v1` | OpenAI-compatible SoCLaaS base URL. |
+| `EMAIL_TRIAGE_MODEL` | unset | Exact model ID used for classification. |
+| `OUTLOOK_PROFILE` | default profile | Optional classic Outlook profile name. |
+| `OUTLOOK_TRIAGE_TIMEZONE` | `Asia/Singapore` | IANA timezone used for dates, deadlines, and reports. |
+| `OUTLOOK_TRIAGE_BOOTSTRAP_DAYS` | `7` | Initial synchronization lookback. |
+| `OUTLOOK_TRIAGE_OVERLAP_HOURS` | `8` | Rescan overlap before the synchronization high-water mark. |
+| `OUTLOOK_TRIAGE_MAX_BODY_CHARS` | `12000` | Maximum cleaned body characters sent for classification. |
+| `OUTLOOK_TRIAGE_DIGEST_HORIZON_DAYS` | `7` | Upcoming-deadline window in the digest. |
+| `OUTLOOK_TRIAGE_TIMEOUT_SECONDS` | `45` | SoCLaaS request timeout. |
+| `TELEGRAM_BOT_TOKEN` | unset | Optional Telegram bot credential. |
+| `TELEGRAM_CHAT_ID` | unset | Optional private destination chat ID. |
+| `TELEGRAM_TIMEOUT_SECONDS` | `20` | Telegram request timeout. |
+| `TELEGRAM_BODY_PREVIEW_CHARS` | `6000` | Maximum original body characters returned by `/show`. |
+| `OUTLOOK_TRIAGE_RELAY_URL` | unset | Cloudflare Worker base URL; setting any relay value requires all three relay credentials. |
+| `OUTLOOK_TRIAGE_RELAY_TOKEN` | unset | Independent bearer secret used only for bundle upload and status requests. |
+| `OUTLOOK_TRIAGE_RELAY_ENCRYPTION_KEY` | unset | Base64url-encoded 32-byte AES-GCM key shared with the Worker. |
+| `OUTLOOK_TRIAGE_RELAY_TIMEOUT_SECONDS` | `20` | Relay upload and status request timeout. |
+
+Advanced path overrides are available as process environment variables:
+
+| Setting | Default location |
+| --- | --- |
+| `OUTLOOK_TRIAGE_CONFIG_DIR` | `%APPDATA%\OutlookTriage` |
+| `OUTLOOK_TRIAGE_DATA_DIR` | `%LOCALAPPDATA%\OutlookTriage` |
+| `OUTLOOK_TRIAGE_STATE_DIR` | `%LOCALAPPDATA%\OutlookTriage\state` |
+| `OUTLOOK_TRIAGE_SECRETS_FILE` | `%APPDATA%\OutlookTriage\secrets.env` |
+| `OUTLOOK_TRIAGE_RULES_FILE` | `%APPDATA%\OutlookTriage\rules.yaml` |
+| `OUTLOOK_TRIAGE_DATABASE` | `%LOCALAPPDATA%\OutlookTriage\outlook-triage.db` |
+| `OUTLOOK_TRIAGE_REPORTS_DIR` | `%LOCALAPPDATA%\OutlookTriage\reports` |
+| `OUTLOOK_TRIAGE_LOG_FILE` | `%LOCALAPPDATA%\OutlookTriage\logs\outlook-triage.log` |
+| `OUTLOOK_TRIAGE_LOCK_DIR` | `%LOCALAPPDATA%\OutlookTriage\state\sync.lock` |
+
+The SQLite database contains discovered message metadata, classifications, local tasks, run history, pending Telegram chunks, the inbound update offset, and a minimal command audit. The audit stores command type, referenced task IDs, state, authorized chat ID, and sanitized error category; it does not store raw command text, email bodies, or Outlook identifiers. Retry arguments and task filters are also excluded. Reports are Markdown files. Logs rotate and exclude message bodies, API keys, full Outlook `EntryID` values, and arbitrary Telegram command text.
+
+## Filtering behavior
+
+Edit `%APPDATA%\OutlookTriage\rules.yaml` to define exact sender addresses, exact sender domains, and regular expressions matched against subjects:
+
+```yaml
+ignored_senders:
+  - newsletter@example.com
+ignored_domains:
+  - marketing.example.com
+ignored_subject_patterns:
+  - '^Weekly digest'
+```
+
+All matches are case-insensitive. Filters are applied before a message body is sent to SoCLaaS, and a match is recorded as explicitly skipped. The application does not implicitly discard all `no-reply` senders or low-importance messages.
+
+Before classification, the application removes common quoted-message history, quoted lines, URL query strings and fragments, excess whitespace, and text beyond `OUTLOOK_TRIAGE_MAX_BODY_CHARS`.
+
+## Exit status and troubleshooting
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The command completed; a Telegram summary may still report deliveries paused for user attention. |
+| `1` | Configuration, locking, Outlook, SoCLaaS, Telegram, or requested-record failure. |
+| `2` | `sync` or `retry-failed` completed with one or more failed classifications; invalid command syntax also uses the standard parser exit code 2. |
+| `130` | The user interrupted the command with Ctrl+C. |
+
+Common failures behave as follows:
+
+- **Classic Outlook is missing or unavailable:** the command stops without changing Outlook. Confirm classic Outlook is installed, open, configured, and signed in.
+- **Profile or Inbox is unavailable:** check `OUTLOOK_PROFILE`; leave it blank to use the default profile.
+- **Outlook Programmatic Access is denied:** do not weaken Trust Center, antivirus, registry, or Group Policy settings. Ask the organization administrator to resolve the policy restriction.
+- **Outlook is busy or COM access fails:** the run fails and preserves the previous synchronization watermark. Close blocking dialogs, confirm Outlook is responsive, and retry.
+- **Another sync or retry is running:** wait for it to finish. Investigate a stale lock only after confirming no `outlook-triage` process is active.
+- **SoCLaaS returns `429`, times out, cannot connect, or returns `5xx`:** classification retries with exponential backoff and jitter. Remaining failures are retained for `retry-failed`.
+- **SoCLaaS returns `401` or `403`:** correct the API key or access policy; the request is not retried as a transient failure.
+- **The model returns invalid JSON:** the application attempts one repair request, then retains the message for `retry-failed`.
+- **A digest warns that no sync completed or the latest sync failed:** resolve the synchronization problem, run `sync` or `retry-failed`, and generate the digest again.
+- **Telegram delivery needs attention:** inspect the sanitized local log, correct the configuration or chat problem, and run `outlook-triage telegram-retry`.
+- **Telegram listener reports a webhook conflict:** identify the owning deployment and follow the deliberate recovery steps in [Advanced Cloud](Cloud-Bot.md), or use a dedicated bot before using long polling; Telegram does not permit both receivers simultaneously.
+- **Telegram listener says another receiver is active:** stop the other listener or wait for `telegram-poll`/`telegram-chats` to finish. Investigate the receiver lock only after confirming no listener process is active.
+- **A Telegram Outlook command fails:** confirm classic Outlook is open and responsive under the scheduled task's interactive Windows user, then retry the command.
+- **Relay publication remains pending:** run `outlook-triage relay-status`, confirm the Worker URL and secrets match, then run `outlook-triage relay-publish`. Outlook synchronization remains committed even when relay upload fails.
+- **A Telegram `/list`, `/sync`, or `/retry` command fails:** follow the sanitized reply, inspect the local log for operational detail, correct the local configuration/service problem, and resend. A transport retry after the operation was applied will not repeat the work.
+- **A batch command partially completes:** the bot reports how many tasks completed. Those task changes are retained; remaining task statuses are unchanged, and resending the complete command is safe.
+
+Use the global verbose option for interactive diagnosis:
+
+```powershell
+outlook-triage --verbose sync
+```
+
+Do not post `secrets.env`, the SQLite database, reports, or verbose output containing organizational details in public support channels.
+## Informational email summaries
+
+The inbox brief includes **Informational emails · last 72 hours**, immediately after
+Waiting / follow-up. Each entry contains the sender, subject, saved SoCLaaS summary,
+and an informational reference such as `#i42`. Only unread emails classified as
+information with no required action appear; newsletters, automated emails, and
+explicitly ignored messages remain excluded. Existing Last 24 hours statistics
+keep their original window.
+
+- `/show #i42` displays a bounded preview of the original email without marking it read.
+- `/read #i42` marks the original email read in Outlook and removes it from future briefs after confirmation.
+- `/read #i42 #i43` processes multiple informational emails. Send task references such as `#42` in a separate command.
+
+In cloud mode, informational reads show progress inside the current digest and
+remove the entries after Outlook confirms success. Separate queued/marked replies
+are suppressed when a current editable digest covers the emails. Accepted commands
+are cleaned up after feedback is visible; failures and `/show` content remain.
+Without a covering digest, the bot sends a concise fallback with the `#i` references.
+
+Reading an email directly in Outlook removes it after the next successful read-state
+synchronization. Entries expire 72 hours after receipt. Unknown read states remain
+hidden until checked; a failed refresh retains the last confirmed state and shows
+a synchronization warning. Existing task commands and task counts are unchanged.
+
+Cloud read commands wait for the Windows bridge. Cloud `/show` requires the bridge's
+existing `--cache-previews` option; previews are bounded and encrypted. Summaries
+are reused from classification without another SoCLaaS request. Informational
+summaries are included in the configured Telegram destination.
+
+Cached previews are limited to open/waiting tasks and unread informational emails
+within 72 hours. Completed/dismissed tasks and read/expired informational emails
+lose cloud previews automatically. If Outlook can no longer supply a body, its
+preview is omitted from the next publication. Summaries and task history are kept.
+Reopened tasks receive a preview after the next publication with caching enabled.
+
+Cloud `/show` previews and their accepted `/show` commands are removed when you
+send your next valid command. Another `/show` replaces the previous preview.
+All preview parts are tracked; unsent older parts are cancelled. Errors and the
+daily brief remain. Cleanup is subject to Telegram's deletion limits, and older
+untracked previews may require manual deletion.
