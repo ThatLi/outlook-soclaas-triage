@@ -1,4 +1,4 @@
-import { digestTaskGroups, digestTaskParts, remainingLabel, textChunks, type BridgeSnapshot } from "./cloud";
+import { digestTaskGroups, digestTaskParts, remainingLabel, textChunks, informationalEmails, informationParts, type BridgeSnapshot } from "./cloud";
 import { escapeHtml, singaporeClock } from "./index";
 import type { DigestGroup } from "./task-feedback";
 
@@ -6,7 +6,7 @@ interface Fragment { summary?: string; html: string }
 
 // Only renderer-owned HTML enters this packer; mailbox strings are escaped first.
 export function renderRichDigest(data: BridgeSnapshot | null, now = new Date(), fixedGroups?: DigestGroup[],
-  annotations = new Map<number, string>(), feedback = "", news?: string): string[] {
+  annotations = new Map<number, string>(), feedback = "", news?: string, frozenInformation = false, informationAnnotations = new Map<number, string>()): string[] {
   const today = singaporeClock(now).date;
   const fragments: Fragment[] = [];
   const paragraph = (html: string, summary?: string) => fragments.push({ summary, html: `<p>${html.replaceAll("\n", "<br>")}</p>` });
@@ -28,6 +28,12 @@ export function renderRichDigest(data: BridgeSnapshot | null, now = new Date(), 
         for (const part of digestTaskParts(task, today, annotations.get(task.id))) paragraph(part, summary);
       }
     });
+    const information = informationalEmails(data, now, frozenInformation);
+    const informationHeading = "ℹ️ <b>INFORMATIONAL EMAILS · LAST 72 HOURS</b>";
+    if (!information.length) paragraph("No unread informational emails.", informationHeading);
+    for (const item of information) {
+      for (const part of informationParts(item, informationAnnotations.get(item.id))) paragraph(part, informationHeading);
+    }
     for (const [label, key] of [["Informational", "information_count"], ["Newsletters", "newsletter_count"],
       ["Automated", "automated_count"], ["Explicitly skipped", "skipped_count"]]) {
       paragraph(`• ${label}: <b>${escapeHtml(String(data.counts[key] ?? 0))}</b>`, "📊 Recent activity · last 24 hours at snapshot preparation");

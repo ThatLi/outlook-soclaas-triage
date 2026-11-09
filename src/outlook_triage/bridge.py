@@ -69,10 +69,17 @@ def publish_bridge(db: Database, settings: Settings, client: BridgeClient, *, ca
     tasks = [{name: row[name] for name in (
         "id", "status", "description", "deadline", "urgency", "sender_name", "sender_address", "subject"
     )} for row in db.list_tasks()]
-    if cache_previews and tasks:
+    information = [{name: row[name] for name in (
+        "id", "summary", "subject", "sender_name", "sender_address", "received_at", "is_read"
+    )} for row in db.information(now)]
+    for item in information:
+        item["is_read"] = bool(item["is_read"]) if item["is_read"] is not None else None
+    if cache_previews and (tasks or information):
         with process_lock(settings.lock_dir):
             with outlook_factory(settings.outlook_profile, timezone=settings.timezone) as outlook:
                 for task in tasks:
+                    if task["status"] not in {"open", "waiting"}:
+                        continue
                     row = db.task_email(task["id"])
                     try:
                         task["preview"] = outlook.get_body_preview(
@@ -81,9 +88,19 @@ def publish_bridge(db: Database, settings: Settings, client: BridgeClient, *, ca
                     except OutlookError:
                         # Missing/moved mail must not stop publication of the other tasks.
                         continue
+                for item in information:
+                    if item["is_read"] is not False:
+                        continue
+                    row = db.information_email(item["id"])
+                    try:
+                        item["preview"] = outlook.get_body_preview(
+                            row["source_id"], row["store_id"], limit=min(12000, settings.telegram_body_preview_chars),
+                        )
+                    except OutlookError:
+                        continue
     snapshot = db.digest_snapshot((now - timedelta(hours=24)).isoformat(timespec="seconds"))
     payload["bridge"] = {
-        "dataset_id": client.dataset_id, "tasks": tasks,
+        "dataset_id": client.dataset_id, "tasks": tasks, "information": information,
         "horizon_days": settings.digest_horizon_days,
         "health": db.operational_status(), "counts": snapshot["counts"],
         "processed_telegram_updates": [row[0] for row in db.connection.execute(
@@ -128,6 +145,32 @@ def process_job(db: Database, settings: Settings, client: BridgeClient, job: dic
                 _save_receipt(db, receipt_key, 0, counts)
             publish_bridge(db, settings, client, cache_previews=cache_previews, outlook_factory=outlook_factory)
             client.acknowledge(event_id, counts=counts)
+        elif job["action"] == "read_information":
+            ids = job["task_ids"]
+            if not ids or len(ids) > 100 or any(type(value) is not int or value < 1 for value in ids):
+                raise OutlookError("Invalid informational reference list")
+            successes, failures = [], []
+            with process_lock(settings.lock_dir):
+                with outlook_factory(settings.outlook_profile, timezone=settings.timezone) as outlook:
+                    for information_id in ids:
+                        if information_id in job["completed_ids"]:
+                            continue
+                        row = db.information_email(information_id)
+                        try:
+                            if row is None:
+                                raise OutlookError("Informational email missing locally")
+                            if _receipt(db, receipt_key, information_id) is None:
+                                outlook.mark_read(row["source_id"], row["store_id"])
+                                _save_receipt(db, receipt_key, information_id, {"read": True})
+                            db.set_email_read(row["message_key"], True)
+                            successes.append(information_id)
+                        except OutlookError:
+                            failures.append(information_id)
+            publish_bridge(db, settings, client, cache_previews=cache_previews, outlook_factory=outlook_factory)
+            for information_id in successes:
+                client.acknowledge(event_id, task_id=information_id)
+            if failures:
+                client.acknowledge(event_id, failed=True)
         elif job["action"] in {"read", "done", "dismiss"}:
             ids = [int(value) for value in job["task_ids"]]
             if not ids or len(ids) > 100:

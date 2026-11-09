@@ -1,10 +1,10 @@
 import {
-  decryptEnvelope, escapeHtml, singaporeClock, telegramSend, validateEnvelope,
+  decryptEnvelope, encryptEnvelope, escapeHtml, singaporeClock, telegramSend, validateEnvelope,
   type BundlePayload, type Env,
 } from "./index";
 import { deliverDigest, digestCallback, dirtyDigests, ensureDigestLayouts, queueDigest, refreshDigests, type DigestCallback, type DigestRow } from "./interactive-digest";
 import { TelegramFailure, telegramRequest } from "./telegram-api";
-import { flushFeedback, taskFeedback, type DigestGroup } from "./task-feedback";
+import { flushFeedback, taskFeedback, trackCleanup, type DigestGroup } from "./task-feedback";
 import { seal, unseal } from "./cloud_crypto";
 export { seal, unseal } from "./cloud_crypto";
 
@@ -13,9 +13,14 @@ export interface CloudTask {
   id: number; status: Status; description: string; deadline: string | null; urgency: string;
   sender_name: string; sender_address: string; subject: string; preview?: string;
 }
+export interface InformationEmail {
+  id: number; summary: string; subject: string; sender_name: string; sender_address: string;
+  received_at: string; is_read: boolean | null; preview?: string;
+}
 export interface BridgeSnapshot {
   dataset_id: string;
   tasks: CloudTask[];
+  information?: InformationEmail[];
   horizon_days: number;
   health: { last_sync: string | null; last_run: { status: string } | null; pending_or_failed: number };
   counts: Record<string, number | null>;
@@ -25,7 +30,7 @@ interface Event {
   id: number; action: string; task_ids: string; completed_ids: string; retry_limit: number;
   status: string; created_at: string; digest_id: string | null;
 }
-interface Command { action: string; ids: number[]; option?: string; limit: number }
+interface Command { action: string; ids: number[]; option?: string; limit: number; information?: boolean }
 const statuses = ["open", "waiting", "done", "dismissed"];
 const mailboxActions = ["sync", "list", "retry", "read", "done", "dismiss"];
 const help = [
@@ -38,6 +43,9 @@ const help = [
   "/done #id [...] — mark done after Outlook confirms read",
   "/dismiss #id [...] — dismiss after Outlook confirms read",
   "/show #id — previously cached body preview", "/help — command reference",
+  "/show #i42 — informational email preview",
+  "/read #i42 [#i43 ...] — mark informational emails read; hide them after Outlook confirms",
+  "Informational emails remain for up to 72 hours. Send task and informational IDs separately.",
   "Mailbox work waits until the Windows bridge connects. Scheduled sync: every four hours.",
 ].join("\n");
 
@@ -59,6 +67,12 @@ export function parseCloudCommand(text: string): Command | null {
       ? { ...base, limit } : null;
   }
   const parts = arg?.split(/\s+/) ?? [];
+  if (parts.length && parts.every(p => /^#?i[1-9]\d*$/i.test(p))) {
+    if (!["show", "read"].includes(action) || parts.length > 100) return null;
+    const ids = [...new Set(parts.map(p => Number(p.replace(/^#?i/i, ""))))];
+    if (ids.some(id => !Number.isSafeInteger(id)) || (action === "show" && ids.length !== 1)) return null;
+    return { ...base, ids, information: true };
+  }
   if (!parts.length || parts.length > 100 || parts.some(p => !/^#?[1-9]\d*$/.test(p))) return null;
   const ids = [...new Set(parts.map(p => Number(p.replace(/^#/, ""))))];
   if (ids.some(id => !Number.isSafeInteger(id)) || (action === "show" && ids.length !== 1)) return null;
@@ -86,7 +100,67 @@ export function validateBridge(value: unknown): BridgeSnapshot {
     }
     ids.add(task.id);
   }
+  if (data.information !== undefined) {
+    if (!Array.isArray(data.information)) throw new Error("Invalid informational emails");
+    const informationIds = new Set<number>();
+    for (const item of data.information) {
+      if (!item || !Number.isSafeInteger(item.id) || item.id < 1 || informationIds.has(item.id)
+        || [item.summary, item.subject, item.sender_name, item.sender_address].some(v => typeof v !== "string")
+        || !item.summary.trim() || item.summary.length > 1000
+        || typeof item.received_at !== "string" || !/(Z|[+-]\d{2}:\d{2})$/.test(item.received_at)
+        || Number.isNaN(Date.parse(item.received_at)) || ![true, false, null].includes(item.is_read)
+        || (item.preview !== undefined && (typeof item.preview !== "string" || item.preview.length > 12000))) {
+        throw new Error("Invalid informational email");
+      }
+      informationIds.add(item.id);
+    }
+  }
   return data;
+}
+
+export function informationalEmails(data: BridgeSnapshot, now: Date, frozen = false): InformationEmail[] {
+  return (data.information ?? []).filter(item => item.is_read === false
+    && (frozen || (Date.parse(item.received_at) > now.getTime() - 72 * 3600000 && Date.parse(item.received_at) <= now.getTime())))
+    .sort((a, b) => Date.parse(b.received_at) - Date.parse(a.received_at) || a.id - b.id);
+}
+
+function previewAvailable(item: CloudTask | InformationEmail, now: Date): boolean {
+  if ("status" in item) return ["open", "waiting"].includes(item.status);
+  return item.is_read === false && Date.parse(item.received_at) > now.getTime() - 72 * 3600000
+    && Date.parse(item.received_at) <= now.getTime();
+}
+
+async function pruneSnapshotPreviews(env: Env, now = new Date()): Promise<void> {
+  const row = await env.DB.prepare("SELECT envelope_json FROM cloud_snapshot WHERE singleton=1").first<{ envelope_json: string }>();
+  if (!row) return;
+  const envelope = validateEnvelope(JSON.parse(row.envelope_json));
+  const payload = await decryptEnvelope(envelope, env.RELAY_ENCRYPTION_KEY);
+  const data = validateBridge(payload.bridge);
+  const states = await env.DB.prepare("SELECT id,status FROM cloud_tasks").all<{ id: number; status: Status }>();
+  const lookup = new Map(states.results.map(task => [task.id, task.status]));
+  let changed = false;
+  for (const item of [...data.tasks, ...(data.information ?? [])]) {
+    const effective = "status" in item ? { ...item, status: lookup.get(item.id) ?? item.status } : item;
+    if (item.preview !== undefined && !previewAvailable(effective, now)) {
+      delete item.preview;
+      changed = true;
+    }
+  }
+  if (changed) {
+    const updated = await encryptEnvelope(envelope, payload, env.RELAY_ENCRYPTION_KEY);
+    await env.DB.prepare("UPDATE cloud_snapshot SET envelope_json=? WHERE singleton=1")
+      .bind(JSON.stringify(updated)).run();
+  }
+}
+
+export function informationParts(item: InformationEmail, annotation = ""): string[] {
+  const reference = `<code>#i${item.id}</code>`;
+  return [
+    ...textChunks(item.subject, 1800).map(value => `ℹ️ ${reference}${annotation} <b>${value}</b>`),
+    ...textChunks(item.sender_name || item.sender_address, 1800).map(value => `<i>${value}</i>`),
+    ...textChunks(item.summary, 1800),
+    `<code>/show #i${item.id}</code> · <code>/read #i${item.id}</code>`,
+  ];
 }
 
 // Escape after splitting: long bodies cannot split an HTML entity or tag.
@@ -101,11 +175,11 @@ export function textChunks(text: string, limit = 3400): string[] {
   if (chunk) chunks.push(chunk);
   return chunks;
 }
-async function outbox(env: Env, chunks: string[], listEvent?: number | string): Promise<D1PreparedStatement> {
+async function outbox(env: Env, chunks: string[], replyEvent?: number | string): Promise<D1PreparedStatement> {
   const id = crypto.randomUUID();
-  const column = typeof listEvent === "string" ? "dedupe_key" : "id";
+  const column = typeof replyEvent === "string" ? "dedupe_key" : "id";
   return env.DB.prepare(`INSERT INTO cloud_outbox(id,sealed_chunks,created_at,list_event_id) VALUES(?,?,?,(SELECT id FROM cloud_events WHERE ${column}=?))`)
-    .bind(id, await seal(env, id, chunks), new Date().toISOString(), listEvent ?? null);
+    .bind(id, await seal(env, id, chunks), new Date().toISOString(), replyEvent ?? null);
 }
 
 async function withLock(env: Env, work: () => Promise<Response>): Promise<Response> {
@@ -198,7 +272,7 @@ export function digestTaskGroups(data: BridgeSnapshot, now = new Date(), fixedGr
   return groups;
 }
 
-export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>()): string[] {
+export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups?: DigestGroup[], annotations = new Map<number, string>(), frozenInformation = false, informationAnnotations = new Map<number, string>()): string[] {
   const today = singaporeClock(now).date;
   const groups = digestTaskGroups(data, now, fixedGroups);
   const emojis = ["🔴", "🟠", "🟡", "⚪", "💤"];
@@ -228,8 +302,13 @@ export function renderDigest(data: BridgeSnapshot, now = new Date(), fixedGroups
       compact = [];
     } else compact.push(...parts);
   }
-  const pages = [...messages, ...packDigestBlocks(compact)];
-  return pages.length === 1 ? [...pages, "No active tasks."] : pages;
+  const information = informationalEmails(data, now, frozenInformation);
+  const infoTitle = "ℹ️ <b>INFORMATIONAL EMAILS · LAST 72 HOURS</b>";
+  const infoPages = packDigestBlocks(information.flatMap(item => informationParts(item, informationAnnotations.get(item.id))), 2800);
+  const pages = [...messages, ...packDigestBlocks(compact),
+    ...(infoPages.length ? infoPages.map(page => `${infoTitle}\n\n${page}`) : [
+      `${groups.every(([, tasks]) => tasks.every(task => !["open", "waiting"].includes(task.status))) ? "No active tasks.\n\n" : ""}${infoTitle}\n\nNo unread informational emails.`])];
+  return pages;
 }
 
 async function flush(env: Env, now = new Date()): Promise<void> {
@@ -243,7 +322,7 @@ async function flush(env: Env, now = new Date()): Promise<void> {
     id: string; sealed_chunks: string; next_chunk: number; digest_id: string | null; list_event_id: number | null;
   }>();
   let budget = 3;
-  let listRepliesSent = false;
+  let trackedRepliesSent = false;
   for (const row of rows.results) {
     if (row.digest_id) {
       const digest = await env.DB.prepare("SELECT * FROM interactive_digests WHERE id=?").bind(row.digest_id).first<DigestRow>();
@@ -260,9 +339,8 @@ async function flush(env: Env, now = new Date()): Promise<void> {
         if (row.list_event_id !== null) {
           const result = await telegramRequest(env, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text: chunks[i], parse_mode: "HTML", disable_web_page_preview: true });
           if (!Number.isSafeInteger(result.message_id) || result.message_id! <= 0) throw new Error("Telegram did not return a reply message ID");
-          statements.push(env.DB.prepare("INSERT INTO cloud_task_feedback(event_id,command_message_id,expires_at,allow_fallback,created_at) VALUES(?,?,?,0,?)")
-            .bind(row.list_event_id, result.message_id!, Date.now() + 48 * 3600000 - 60000, new Date().toISOString()));
-          listRepliesSent = true;
+          statements.push(trackCleanup(env, row.list_event_id, { message: result.message_id!, date: Date.now() / 1000 }));
+          trackedRepliesSent = true;
         } else await telegramSend(env, chunks[i]);
       } catch (error) {
         if (error instanceof TelegramFailure && error.retryAfter) await env.DB.prepare("UPDATE cloud_lock SET telegram_retry_at=? WHERE singleton=1")
@@ -272,7 +350,7 @@ async function flush(env: Env, now = new Date()): Promise<void> {
       await env.DB.batch(statements);
     }
   }
-  if (listRepliesSent) await flushFeedback(env);
+  if (trackedRepliesSent) await flushFeedback(env);
 }
 
 async function webhook(request: Request, env: Env): Promise<Response> {
@@ -294,15 +372,16 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     const data = await snapshot(env);
     if (data?.processed_telegram_updates?.includes(update.update_id!)) return Response.json({ ok: true });
     const ids = cmd?.ids ?? [];
-    const missing = ids.filter(id => !data?.tasks.some(t => t.id === id));
+    const missing = ids.filter(id => !(cmd?.information ? data?.information : data?.tasks)?.some(t => t.id === id));
     const quiet = Boolean(cmd && data && !missing.length && ["read", "done", "dismiss", "waiting", "reopen"].includes(cmd.action));
     if (quiet) await ensureDigestLayouts(env, data!);
     let chunks: string[];
     let pending = false;
-    if (!cmd) chunks = ["Unknown command or invalid arguments. Use /help."];
+    let preview = false;
+    if (!cmd) chunks = ["Unknown command or invalid arguments. Send task and informational IDs in separate commands. Use /help."];
     else if (cmd.action === "help") chunks = [help];
     else if (!data) chunks = ["No bridge snapshot yet. Run outlook-triage bridge-poll on Windows to initialize cloud state."];
-    else if (missing.length) chunks = textChunks(`Tasks not found: ${missing.map(id => `#${id}`).join(", ")}. No changes made.`);
+    else if (missing.length) chunks = textChunks(`${cmd.information ? "Informational emails" : "Tasks"} not found: ${missing.map(id => `#${cmd.information ? "i" : ""}${id}`).join(", ")}. No changes made.`);
     else if (cmd.action === "status") {
       const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM cloud_events WHERE status='pending'").first<{ count: number }>();
       const bridge = await env.DB.prepare("SELECT last_seen FROM cloud_snapshot WHERE singleton=1").first<{ last_seen: string }>();
@@ -312,8 +391,10 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       const tasks = data.tasks.filter(t => cmd.option === "all" || t.status === cmd.option);
       chunks = textChunks(`Tasks · ${cmd.option}\n${tasks.map(t => `#${t.id} [${t.status}] [${t.urgency}] ${t.description}${t.deadline ? ` — due ${t.deadline}` : ""}`).join("\n\n") || "No matching tasks."}`);
     } else if (cmd.action === "show") {
-      const task = data.tasks.find(t => t.id === ids[0])!;
-      chunks = task.preview === undefined ? ["No cached body preview. Enable bridge preview caching on Windows and reconnect."]
+      const task = (cmd.information ? data.information : data.tasks)!.find(t => t.id === ids[0])!;
+      preview = previewAvailable(task, new Date()) && task.preview !== undefined;
+      chunks = !previewAvailable(task, new Date()) ? ["This email is no longer eligible for a cached preview."]
+        : task.preview === undefined ? ["No cached body preview. Enable bridge preview caching on Windows and reconnect."]
         : textChunks(`Email preview · ${task.subject}\nCached at the last bridge publication; bounded preview.\n\n${task.preview || "(empty body)"}`);
     } else if (["waiting", "reopen"].includes(cmd.action)) {
       chunks = textChunks(`Cloud tasks ${ids.map(id => `#${id}`).join(", ")} marked ${cmd.action === "waiting" ? "waiting" : "open"}.`);
@@ -322,8 +403,10 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       chunks = [`⏳ /${cmd.action} queued. It will complete when the Windows Outlook bridge connects.`];
     }
     const event = env.DB.prepare("INSERT INTO cloud_events(dedupe_key,action,task_ids,retry_limit,status,created_at) VALUES(?,?,?,?,?,?)")
-      .bind(key, missing.length ? "invalid" : cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
+      .bind(key, missing.length ? "invalid" : cmd?.information && cmd.action === "read" ? "read_information" : cmd?.action ?? "invalid", JSON.stringify(ids), cmd?.limit ?? 50, pending ? "pending" : "done", new Date().toISOString());
     const statements = [event];
+    if (cmd && !missing.length) statements.push(env.DB.prepare(`DELETE FROM cloud_outbox WHERE list_event_id IN (
+      SELECT id FROM cloud_events WHERE action='show' AND id<(SELECT id FROM cloud_events WHERE dedupe_key=?))`).bind(key));
     if (cmd && data && !missing.length && ["waiting", "reopen"].includes(cmd.action)) {
       for (const id of ids) statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=(SELECT id FROM cloud_events WHERE dedupe_key=?) WHERE id=?")
         .bind(cmd.action === "waiting" ? "waiting" : "open", key, id));
@@ -333,8 +416,11 @@ async function webhook(request: Request, env: Env): Promise<Response> {
       const digest = await queueDigest(env);
       statements.push(...digest.statements, env.DB.prepare("UPDATE cloud_events SET digest_id=? WHERE dedupe_key=?").bind(digest.id, key));
     }
-    if (quiet) statements.push(...await taskFeedback(env, key, ids, { message: message.message_id, date: message.date }));
-    else statements.push(await outbox(env, chunks, cmd?.action === "list" && pending ? key : undefined));
+    if (quiet) statements.push(...await taskFeedback(env, key, ids, { message: message.message_id, date: message.date }, true, cmd!.information));
+    else {
+      if (preview) statements.push(trackCleanup(env, key, { message: message.message_id, date: message.date }));
+      statements.push(await outbox(env, chunks, (cmd?.action === "list" && pending) || preview ? key : undefined));
+    }
     await env.DB.batch(statements);
     await flush(env);
     return Response.json({ ok: true });
@@ -356,6 +442,7 @@ async function acceptSnapshot(request: Request, env: Env): Promise<Response> {
     statements.push(dirtyDigests(env));
     // Batch in one transaction: a task import and its encrypted details stay consistent.
     await env.DB.batch(statements);
+    await pruneSnapshotPreviews(env);
     await flush(env);
     return Response.json({ status: "stored", bundle_id: envelope.bundle_id });
   });
@@ -387,10 +474,10 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
     const completed: number[] = JSON.parse(event.completed_ids);
     const statements: D1PreparedStatement[] = [];
     if (body.task_id !== undefined) {
-      if (!ids.includes(body.task_id) || !["read", "done", "dismiss"].includes(event.action)) return Response.json({ error: "Task not in command" }, { status: 400 });
+      if (!ids.includes(body.task_id) || !["read", "done", "dismiss", "read_information"].includes(event.action)) return Response.json({ error: "Item not in command" }, { status: 400 });
       if (completed.includes(body.task_id) && !body.failed) { await flush(env); return Response.json({ ok: true }); }
       if (!completed.includes(body.task_id)) completed.push(body.task_id);
-      if (event.action !== "read") statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=? WHERE id=? AND revision<=?")
+      if (["done", "dismiss"].includes(event.action)) statements.push(env.DB.prepare("UPDATE cloud_tasks SET status=?,revision=? WHERE id=? AND revision<=?")
         .bind(event.action === "done" ? "done" : "dismissed", event.id, body.task_id, event.id));
       statements.push(env.DB.prepare("UPDATE cloud_events SET completed_ids=? WHERE id=?").bind(JSON.stringify(completed), event.id));
     }
@@ -401,6 +488,9 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
       let message = body.failed
         ? `/${event.action} failed on the bridge. ${completed.length}/${ids.length} mailbox items completed; earlier successes were kept. Check Windows logs and resend to retry.`
         : `✅ /${event.action} completed on the Outlook bridge.${ids.length ? ` Emails marked read: ${ids.map(id => `#${id}`).join(", ")}. Later cloud task changes take precedence.` : ""}`;
+      if (event.action === "read_information") message = body.failed
+        ? `Informational read failed: ${completed.length}/${ids.length} completed. Earlier successes were kept; resend to retry.`
+        : `✅ Informational emails marked read: ${ids.map(id => `#i${id}`).join(", ")}.`;
       if (body.counts) {
         const counts = body.counts;
         message += `\n${["processed", "skipped", "failed", "unchanged"].map(k => `${k}=${Number.isSafeInteger(counts[k]) ? counts[k] : 0}`).join(" ")}`;
@@ -408,11 +498,13 @@ async function bridgeAck(request: Request, env: Env): Promise<Response> {
       const chunks = textChunks(message);
       if (event.action === "list" && event.digest_id) statements.push(env.DB.prepare("UPDATE interactive_digests SET dirty=1 WHERE id=? AND digest_date=? AND disabled=0")
         .bind(event.digest_id, singaporeClock(new Date()).date));
-      if (body.failed || !["read", "done", "dismiss"].includes(event.action)) statements.push(await outbox(env, chunks,
+      if (body.failed || !["read", "done", "dismiss", "read_information"].includes(event.action)) statements.push(await outbox(env, chunks,
         event.action === "list" && !body.failed ? event.id : undefined));
     }
     if (["read", "done", "dismiss"].includes(event.action)) statements.push(...await taskFeedback(env, event.id, ids, undefined, !body.failed));
+    if (event.action === "read_information") statements.push(...await taskFeedback(env, event.id, ids, undefined, !body.failed, true));
     if (statements.length) await env.DB.batch(statements);
+    if (["done", "dismiss", "read_information"].includes(event.action)) await pruneSnapshotPreviews(env);
     await flush(env);
     return Response.json({ ok: true });
   });
@@ -439,6 +531,7 @@ export async function cloudFetch(request: Request, env: Env): Promise<Response> 
 
 export async function runCloudScheduled(env: Env, now = new Date()): Promise<void> {
   await withLock(env, async () => {
+    await pruneSnapshotPreviews(env, now);
     const clock = singaporeClock(now);
     const key = `digest:${clock.date}`;
     if (clock.hour >= 8 && !await env.DB.prepare("SELECT id FROM cloud_events WHERE dedupe_key=?").bind(key).first()) {

@@ -181,8 +181,8 @@ def process_command(
         return True
 
     command = parse_command(text)
-    command_name = command.action if command else "invalid"
-    task_ids = command.task_ids if command else ()
+    command_name = (f"{command.action}_information" if command.information_ids else command.action) if command else "invalid"
+    task_ids = (command.information_ids or command.task_ids) if command else ()
     db.record_telegram_update(update_id, chat_id, command_name, task_ids)
 
     if command is None:
@@ -219,6 +219,40 @@ def process_command(
             telegram.send_plain_message("The local task database could not be read. Check the local log and try again.")
             db.set_telegram_update_status(update_id, "failed", error_category="database")
             return True
+
+    if command.information_ids:
+        try:
+            if command.action == "show":
+                row = db.information_email(command.information_ids[0])
+                if row is None:
+                    raise KeyError("Information not found")
+                _show_body(row, telegram, settings, outlook_factory=outlook_factory)
+            else:
+                failures = []
+                with process_lock(settings.lock_dir):
+                    with outlook_factory(settings.outlook_profile, timezone=settings.timezone) as outlook:
+                        for information_id in db.telegram_update_task_ids(update_id, status="pending"):
+                            row = db.information_email(information_id)
+                            try:
+                                if row is None:
+                                    raise KeyError("Information not found")
+                                outlook.mark_read(row["source_id"], row["store_id"])
+                                db.set_email_read(row["message_key"], True)
+                                db.apply_telegram_task(update_id, information_id)
+                            except (OutlookError, KeyError):
+                                failures.append(f"#i{information_id}")
+                applied = len(db.telegram_update_task_ids(update_id, status="applied"))
+                telegram.send_plain_message(f"{applied} informational emails marked read." +
+                    (f" Could not read: {', '.join(failures)}. Earlier successes were kept; resend to retry." if failures else ""))
+                if failures:
+                    db.set_telegram_update_status(update_id, "failed", error_category="outlook")
+                    return True
+            db.set_telegram_update_status(update_id, "responded")
+        except (OutlookError, AlreadyRunning, KeyError, sqlite3.Error) as exc:
+            logger.warning("Informational command failed (%s)", type(exc).__name__)
+            telegram.send_plain_message("Informational email unavailable or Outlook is busy. Earlier successes were kept; try again.")
+            db.set_telegram_update_status(update_id, "failed", error_category="information")
+        return True
 
     rows_by_id = {
         task_id: row

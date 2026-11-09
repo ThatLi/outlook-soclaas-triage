@@ -401,3 +401,43 @@ outlook-triage --verbose sync
 ```
 
 Do not post `secrets.env`, the SQLite database, reports, or verbose output containing organizational details in public support channels.
+## Informational email summaries
+
+The inbox brief includes **Informational emails · last 72 hours**, immediately after
+Waiting / follow-up. Each entry contains the sender, subject, saved SoCLaaS summary,
+and an informational reference such as `#i42`. Only unread emails classified as
+information with no required action appear; newsletters, automated emails, and
+explicitly ignored messages remain excluded. Existing Last 24 hours statistics
+keep their original window.
+
+- `/show #i42` displays a bounded preview of the original email without marking it read.
+- `/read #i42` marks the original email read in Outlook and removes it from future briefs after confirmation.
+- `/read #i42 #i43` processes multiple informational emails. Send task references such as `#42` in a separate command.
+
+In cloud mode, informational reads show progress inside the current digest and
+remove the entries after Outlook confirms success. Separate queued/marked replies
+are suppressed when a current editable digest covers the emails. Accepted commands
+are cleaned up after feedback is visible; failures and `/show` content remain.
+Without a covering digest, the bot sends a concise fallback with the `#i` references.
+
+Reading an email directly in Outlook removes it after the next successful read-state
+synchronization. Entries expire 72 hours after receipt. Unknown read states remain
+hidden until checked; a failed refresh retains the last confirmed state and shows
+a synchronization warning. Existing task commands and task counts are unchanged.
+
+Cloud read commands wait for the Windows bridge. Cloud `/show` requires the bridge's
+existing `--cache-previews` option; previews are bounded and encrypted. Summaries
+are reused from classification without another SoCLaaS request. Informational
+summaries are included in the configured Telegram destination.
+
+Cached previews are limited to open/waiting tasks and unread informational emails
+within 72 hours. Completed/dismissed tasks and read/expired informational emails
+lose cloud previews automatically. If Outlook can no longer supply a body, its
+preview is omitted from the next publication. Summaries and task history are kept.
+Reopened tasks receive a preview after the next publication with caching enabled.
+
+Cloud `/show` previews and their accepted `/show` commands are removed when you
+send your next valid command. Another `/show` replaces the previous preview.
+All preview parts are tracked; unsent older parts are cancelled. Errors and the
+daily brief remain. Cleanup is subject to Telegram's deletion limits, and older
+untracked previews may require manual deletion.

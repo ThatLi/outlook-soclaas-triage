@@ -240,8 +240,29 @@ queue service is needed.
 Use `-CachePreviews` with the scheduler, or `bridge-listen --cache-previews`, to
 upload bounded original email text for `/show`. Default: off. This additionally
 sends original body text to Cloudflare and, on request, Telegram. Attachments are
-never read. Disabling the option and publishing removes previews from the current
-snapshot; previous Telegram messages and pending frozen responses may retain them.
+never read. Only open/waiting tasks and confirmed unread informational emails
+received within the last 72 hours receive previews. Closed tasks, read/expired
+informational emails, and inaccessible Outlook items have no preview in the next
+publication. Other metadata and summaries remain available.
+
+The cloud also removes closed-task previews after Outlook confirms completion,
+and removes expired informational previews through its existing minute schedule,
+including while Windows is offline. `/show` refuses ineligible cached previews
+immediately. Cleanup preserves the original snapshot timestamps and encryption.
+Reopening a task requires a new bridge publication to restore its preview.
+
+Disabling caching and publishing removes all previews from the current snapshot.
+Already sent Telegram messages are unchanged. Previously requested `/show` replies,
+including pending replies, retain the existing delivery and 30-day post-delivery
+cleanup policy; they are separate from the current preview cache.
+
+Successful `/show` previews are temporary chat messages. The next valid command
+in the configured private chat, including another `/show`, deletes the previous
+preview's parts and its `/show` command. Unsent older preview parts are cancelled.
+The daily brief, errors, and the new command's response are preserved. Retries
+and Telegram's deletion age limits still apply; previews sent before this update
+were not tracked and cannot be removed automatically. This does not erase the
+underlying eligible preview cache.
 
 ## Reliability, privacy, and recovery
 
@@ -277,3 +298,32 @@ into SQLite. Stop/disable Cloud Bridge, run `cloud-webhook-disable`, set the loc
 cloud setting to false, set the Worker flag to false and redeploy. Re-enable the
 original Windows schedules and run `relay-publish`. If Windows cannot reconnect,
 preserve cloud D1 first: newer edits and pending work are not yet in local SQLite.
+## Informational digest support
+
+Deploy the updated relay before upgrading and reconnecting the Windows bridge.
+No cloud database migration is required for informational reads; their separate
+internal action uses the existing command queue and completion receipts.
+
+The brief includes unread informational emails received within the last 72 hours.
+Use `/show #i42` for a cached original-body preview and `/read #i42` (or several
+informational references) to queue marking them read. Task IDs and informational
+IDs must be sent separately. Informational emails do not support task workflow
+commands such as `/done` or `/waiting`.
+
+Entries stay visible while a read is queued. The Windows bridge publishes confirmed
+read status before acknowledging completion. Partial successes are retained and
+retries are safe. Reading directly in Outlook is reflected after synchronization.
+Cloud previews require `--cache-previews`; summary delivery does not.
+
+Informational `/read #i42` follows quiet task feedback: the current digest shows
+read progress, then removes confirmed read entries. Covered commands do not send
+separate queued/marked replies. The accepted command is deleted only after its
+feedback is visible, and retries preserve partial successes. If no editable
+current digest covers an informational reference, a concise fallback identifies
+the `#i` references. Failures and `/show` previews remain visible. Deletion uses
+the existing age limits and retry handling. Old notices sent before this update
+were not tracked for cleanup and may need manual deletion.
+
+New editions select the current 72-hour window. An existing edition preserves its
+original summaries and membership, while confirmed reads can remove entries from
+current editions. Older delivered editions remain frozen.

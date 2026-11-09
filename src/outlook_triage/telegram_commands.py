@@ -18,6 +18,9 @@ HELP_TEXT = (
     "/waiting #<task-id> [#<task-id> ...] — mark tasks waiting\n"
     "/reopen #<task-id> [#<task-id> ...] — reopen tasks\n"
     "/show #<task-id> — show a bounded preview without changing read state\n"
+    "/show #i<id> — preview an informational email\n"
+    "/read #i<id> [#i<id> ...] — mark informational emails read and remove them from future digests\n"
+    "Send task and informational references in separate commands.\n"
     "/help — show this message"
 )
 
@@ -45,6 +48,7 @@ class TelegramCommand:
     task_ids: tuple[int, ...] = ()
     option: str | None = None
     limit: int | None = None
+    information_ids: tuple[int, ...] = ()
 
     @property
     def task_id(self) -> int | None:
@@ -81,6 +85,13 @@ def parse_command(text: str) -> TelegramCommand | None:
     if arguments is None:
         return None
     values = arguments.split()
+    if values and all(re.fullmatch(r"#?[iI][1-9]\d*", value) for value in values):
+        if action not in {"show", "read"} or len(values) > 100:
+            return None
+        ids = tuple(dict.fromkeys(int(value.lstrip('#')[1:]) for value in values))
+        if any(value > 9007199254740991 for value in ids) or (action == "show" and len(ids) != 1):
+            return None
+        return TelegramCommand(action, information_ids=ids)
     if not values or any(not re.fullmatch(r"#?[1-9]\d*", value) for value in values):
         return None
     task_ids = tuple(dict.fromkeys(int(value.removeprefix("#")) for value in values))

@@ -302,6 +302,14 @@ def _format_outlook_digest(markdown: str, *, limit: int) -> list[str] | None:
         if heading in section_by_heading
     ]
     messages.extend(_pack_sections(rare_parts, limit=limit))
+    information = next((section for section in sections if section.heading == "Informational emails · last 72 hours"), None)
+    if information:
+        content = "\n".join(information.lines) if information.lines != ("- None",) else "No unread informational emails."
+        information_text = f"## {information.heading}\n{content}"
+        chunks = _format_generic_digest(information_text, max_plain_chars=limit)
+        if any(len(chunk) > 4096 for chunk in chunks):
+            chunks = _format_generic_digest(information_text, max_plain_chars=min(limit, 600))
+        messages.extend(chunks)
     return [message for message in messages if message.strip()]
 
 

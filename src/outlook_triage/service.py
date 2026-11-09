@@ -90,13 +90,21 @@ def synchronize(
                 logger=logger,
             )
             counts[outcome] += 1
+        reconciliation_failed = False
+        for row in db.information(datetime.now(settings.timezone)):
+            try:
+                db.set_email_read(row["message_key"], outlook.is_read(row["source_id"], row["store_id"]))
+            except Exception as exc:
+                reconciliation_failed = True
+                logger.warning("Informational read-state refresh failed (%s)", type(exc).__name__)
         db.finish_run(
             run_id,
-            success=counts["failed"] == 0,
+            success=counts["failed"] == 0 and not reconciliation_failed,
             processed=counts["processed"],
             skipped=counts["skipped"],
             failed=counts["failed"],
-            error="one or more classifications failed" if counts["failed"] else None,
+            error=("informational read-state refresh incomplete" if reconciliation_failed else
+                   "one or more classifications failed" if counts["failed"] else None),
         )
         return counts
     except Exception as exc:

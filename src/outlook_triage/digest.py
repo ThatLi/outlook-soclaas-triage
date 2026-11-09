@@ -14,7 +14,7 @@ def _task_line(row) -> str:
     return f"- [#{row['id']}] {row['description']}{deadline}{source}"
 
 
-def build_digest(db: Database, settings: Settings, now: datetime | None = None) -> str:
+def build_digest(db: Database, settings: Settings, now: datetime | None = None, *, information_as_of: datetime | None = None) -> str:
     local_now = now.astimezone(settings.timezone) if now else datetime.now(settings.timezone)
     since = (local_now - timedelta(hours=24)).isoformat(timespec="seconds")
     snapshot = db.digest_snapshot(since)
@@ -62,6 +62,16 @@ def build_digest(db: Database, settings: Settings, now: datetime | None = None) 
     for heading, items in sections:
         lines.extend(["", f"## {heading}"])
         lines.extend(_task_line(row) for row in items) if items else lines.append("- None")
+
+    information = db.information(information_as_of or local_now, unread_only=True)
+    lines.extend(["", "## Informational emails · last 72 hours"])
+    for row in information:
+        sender = " ".join((row["sender_name"] or row["sender_address"]).split())
+        subject = " ".join(row["subject"].split())
+        summary = " ".join(row["summary"].split())
+        lines.append(f"- ℹ #i{row['id']} {subject} — {sender}: {summary} · /show #i{row['id']} · /read #i{row['id']}")
+    if not information:
+        lines.append("- None")
 
     counts = snapshot["counts"]
     lines.extend(

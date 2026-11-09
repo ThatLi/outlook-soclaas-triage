@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS emails (
 );
 CREATE INDEX IF NOT EXISTS idx_emails_status ON emails(processing_status);
 CREATE INDEX IF NOT EXISTS idx_emails_received ON emails(received_at);
+CREATE TABLE IF NOT EXISTS information_references (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email_message_key TEXT NOT NULL UNIQUE REFERENCES emails(message_key)
+);
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email_message_key TEXT NOT NULL UNIQUE REFERENCES emails(message_key),
@@ -113,6 +117,12 @@ class Database:
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
+        if "is_read" not in {row[1] for row in self.connection.execute("PRAGMA table_info(emails)")}:
+            self.connection.execute("ALTER TABLE emails ADD COLUMN is_read INTEGER CHECK(is_read IN (0,1))")
+        self.connection.execute("""INSERT OR IGNORE INTO information_references(email_message_key)
+            SELECT message_key FROM emails WHERE processing_status='processed'
+            AND category='information' AND requires_action=0 ORDER BY received_at, message_key""")
+        self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()
@@ -170,6 +180,9 @@ class Database:
                      message.get("subject") or "(no subject)", message.get("receivedDateTime") or now,
                      message.get("importance"), int(bool(message.get("hasAttachments"))), now, now),
                 )
+                if isinstance(message.get("isRead"), bool):
+                    conn.execute("UPDATE emails SET is_read=? WHERE message_key=?",
+                                 (int(message["isRead"]), message["messageKey"]))
             conn.execute(
                 """INSERT INTO sync_state(mailbox, last_received_at, last_success_at) VALUES (?, ?, ?)
                    ON CONFLICT(mailbox) DO UPDATE SET last_received_at=excluded.last_received_at,
@@ -221,6 +234,29 @@ class Database:
                     (message_key, classification.task, data.get("deadline"), classification.urgency,
                      classification.action_type, now, now),
                 )
+
+            if classification.category == "information" and not classification.requires_action:
+                conn.execute("INSERT OR IGNORE INTO information_references(email_message_key) VALUES (?)", (message_key,))
+
+    def information(self, now: datetime, *, unread_only: bool = False) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """SELECT emails.*, information_references.id FROM emails
+            JOIN information_references ON email_message_key=message_key
+            WHERE processing_status='processed' AND category='information' AND requires_action=0
+            AND julianday(received_at)>julianday(?) AND julianday(received_at)<=julianday(?)
+            AND (?=0 OR is_read=0) ORDER BY julianday(received_at) DESC, information_references.id""",
+            ((now - timedelta(hours=72)).isoformat(), now.isoformat(), int(unread_only)),
+        ).fetchall()
+
+    def information_email(self, information_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("""SELECT emails.*, information_references.id FROM emails
+            JOIN information_references ON email_message_key=message_key
+            WHERE information_references.id=? AND processing_status='processed'
+            AND category='information' AND requires_action=0""", (information_id,)).fetchone()
+
+    def set_email_read(self, message_key: str, is_read: bool) -> None:
+        self.connection.execute("UPDATE emails SET is_read=? WHERE message_key=?", (int(is_read), message_key))
+        self.connection.commit()
 
     def pending_messages(self, limit: int = 50) -> list[sqlite3.Row]:
         return self.connection.execute(
@@ -553,7 +589,7 @@ class Database:
     def export_debug_schema(self) -> dict:
         result = {}
         for table in (
-            "emails", "tasks", "sync_state", "runs", "telegram_deliveries",
+            "emails", "tasks", "information_references", "sync_state", "runs", "telegram_deliveries",
             "telegram_updates", "telegram_state",
             "telegram_update_tasks",
         ):
