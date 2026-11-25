@@ -146,11 +146,15 @@ class Database:
 
     def finish_run(self, run_id: int, *, success: bool, processed: int = 0, skipped: int = 0,
                    failed: int = 0, error: str | None = None) -> None:
+        finished_at = local_now()
         self.connection.execute(
             """UPDATE runs SET finished_at=?, status=?, processed_count=?, skipped_count=?,
                failed_count=?, error_summary=? WHERE id=?""",
-            (local_now(), "success" if success else "failed", processed, skipped, failed, error, run_id),
+            (finished_at, "success" if success else "failed", processed, skipped, failed, error, run_id),
         )
+        if success:
+            self.connection.execute("""UPDATE sync_state SET last_success_at=? WHERE mailbox='inbox'
+                AND EXISTS (SELECT 1 FROM runs WHERE id=? AND run_type='sync')""", (finished_at, run_id))
         self.connection.commit()
 
     def get_last_received_at(self, mailbox: str = "inbox") -> str | None:
@@ -187,8 +191,14 @@ class Database:
                 """INSERT INTO sync_state(mailbox, last_received_at, last_success_at) VALUES (?, ?, ?)
                    ON CONFLICT(mailbox) DO UPDATE SET last_received_at=excluded.last_received_at,
                    last_success_at=excluded.last_success_at""",
-                (mailbox, last_received_at, now),
+                (mailbox, last_received_at, self.last_successful_sync() or ""),
             )
+
+    def last_successful_sync(self) -> str | None:
+        # Old sync_state timestamps were saved before classification/reconciliation finished.
+        row = self.connection.execute("""SELECT finished_at FROM runs WHERE run_type='sync'
+            AND status='success' AND finished_at IS NOT NULL ORDER BY id DESC LIMIT 1""").fetchone()
+        return row["finished_at"] if row else None
 
     def email_status(self, message_key: str) -> str | None:
         row = self.connection.execute(
@@ -254,8 +264,9 @@ class Database:
             WHERE information_references.id=? AND processing_status='processed'
             AND category='information' AND requires_action=0""", (information_id,)).fetchone()
 
-    def set_email_read(self, message_key: str, is_read: bool) -> None:
-        self.connection.execute("UPDATE emails SET is_read=? WHERE message_key=?", (int(is_read), message_key))
+    def set_email_read(self, message_key: str, is_read: bool | None) -> None:
+        self.connection.execute("UPDATE emails SET is_read=? WHERE message_key=?",
+                                (int(is_read) if is_read is not None else None, message_key))
         self.connection.commit()
 
     def pending_messages(self, limit: int = 50) -> list[sqlite3.Row]:
@@ -381,20 +392,14 @@ class Database:
                  SUM(CASE WHEN processing_status IN ('pending','failed') THEN 1 ELSE 0 END) AS failed_count
                FROM emails WHERE received_at >= ?""", (since,)
         ).fetchone()
-        sync = self.connection.execute(
-            "SELECT last_success_at FROM sync_state WHERE mailbox='inbox'"
-        ).fetchone()
         last_run = self.connection.execute(
             "SELECT status, error_summary, finished_at FROM runs WHERE run_type='sync' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return {"tasks": self.list_tasks(), "counts": dict(counts) if counts else {},
-                "last_sync": sync["last_success_at"] if sync else None,
+                "last_sync": self.last_successful_sync(),
                 "last_run": dict(last_run) if last_run else None}
 
     def operational_status(self) -> dict:
-        sync = self.connection.execute(
-            "SELECT last_success_at FROM sync_state WHERE mailbox='inbox'"
-        ).fetchone()
         last_run = self.connection.execute(
             "SELECT status, finished_at FROM runs WHERE run_type='sync' ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -406,7 +411,7 @@ class Database:
             "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
         ).fetchall()
         return {
-            "last_sync": sync["last_success_at"] if sync else None,
+            "last_sync": self.last_successful_sync(),
             "last_run": dict(last_run) if last_run else None,
             "pending_or_failed": int(classification["count"]) if classification else 0,
             "task_counts": {str(row["status"]): int(row["count"]) for row in task_rows},

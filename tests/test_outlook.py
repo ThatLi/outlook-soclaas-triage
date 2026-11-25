@@ -6,6 +6,7 @@ import pytest
 
 from outlook_triage.outlook import (
     OutlookClient,
+    OutlookItemNotFound,
     OutlookSecurityError,
     OutlookUnavailable,
     message_key,
@@ -338,3 +339,16 @@ def test_malformed_items_are_skipped_during_sync():
     assert [message["sourceId"] for message in result.messages] == ["valid"]
     assert result.high_water_received_at == "2026-10-02T09:00:00+08:00"
 
+
+
+@pytest.mark.parametrize("operation", ["is_read", "mark_read", "get_message", "get_body_preview"])
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_missing_item_has_distinct_error_from_busy_or_security(operation, wrapped):
+    class MissingItem(Exception):
+        hresult = -2147352567 if wrapped else -2147221233
+        excepinfo = (4096, "Microsoft Outlook", "localized missing message", None, 0, -2147221233) if wrapped else None
+    client, namespace, _ = make_client([])
+    def missing(*args): raise MissingItem()
+    namespace.GetItemFromID = missing
+    with client, pytest.raises(OutlookItemNotFound):
+        getattr(client, operation)("missing-entry", "store-1")

@@ -19,6 +19,10 @@ class OutlookUnavailable(OutlookError):
     pass
 
 
+class OutlookItemNotFound(OutlookError):
+    """The saved item reference no longer resolves (for example after a move)."""
+
+
 class OutlookSecurityError(OutlookError):
     pass
 
@@ -102,6 +106,11 @@ class OutlookClient:
 
     @staticmethod
     def _translate_error(operation: str, exc: Exception) -> OutlookError:
+        # Outlook wraps MAPI_E_NOT_FOUND in DISP_E_EXCEPTION; use codes, not localized text.
+        info = getattr(exc, "excepinfo", None)
+        codes = [getattr(exc, "hresult", None), info[5] if info and len(info) > 5 else None]
+        if any(isinstance(code, int) and code & 0xFFFFFFFF == 0x8004010F for code in codes):
+            return OutlookItemNotFound("The selected Outlook message was moved or deleted; its saved reference no longer resolves.")
         detail = str(exc)
         lowered = detail.lower()
         if any(marker in lowered for marker in ("access denied", "mapi_e_not_supported", "0x80070005", "0x80040102")):

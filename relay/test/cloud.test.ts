@@ -286,6 +286,16 @@ describe("informational emails", () => {
     expect(sent.join("\n")).toContain("#i1");
     expect(renderDigest(data).join("\n")).not.toContain("/read #i1");
   });
+  it.each(["rich", "legacy"])("hides missing references in current %s editions and restores resolved references", async format => {
+    const data = withInformation(); await publish(data); await command("/list");
+    if (format === "legacy") database.db.prepare("UPDATE interactive_digests SET format='legacy',dirty=1").run();
+    data.information![0].is_read = null; await publish(data);
+    expect((await storedPages(digestRows()[0])).join("\n")).not.toContain("/show #i1");
+    await command("/show #i1");
+    expect(sent.at(-1)).not.toContain("Original &lt;body&gt;");
+    data.information![0].is_read = false; await publish(data);
+    expect((await storedPages(digestRows()[0])).join("\n")).toContain("/show #i1");
+  });
   it("freezes edition membership and summaries while removing confirmed reads", async () => {
     const data = withInformation(); await publish(data); await command("/list");
     const row = digestRows()[0];

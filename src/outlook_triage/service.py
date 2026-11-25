@@ -7,7 +7,7 @@ from .config import Settings
 from .database import Database
 from .filters import FilterRules, clean_body, sender_details, skip_reason
 from .models import EmailForClassification
-from .outlook import OutlookClient
+from .outlook import OutlookClient, OutlookItemNotFound
 from .soclaas import SoCLaaSClient
 
 
@@ -94,6 +94,10 @@ def synchronize(
         for row in db.information(datetime.now(settings.timezone)):
             try:
                 db.set_email_read(row["message_key"], outlook.is_read(row["source_id"], row["store_id"]))
+            except OutlookItemNotFound:
+                # Unknown is not unread or a confirmed read; retain the reference for recovery.
+                db.set_email_read(row["message_key"], None)
+                logger.info("Informational reference unavailable (moved or deleted)")
             except Exception as exc:
                 reconciliation_failed = True
                 logger.warning("Informational read-state refresh failed (%s)", type(exc).__name__)

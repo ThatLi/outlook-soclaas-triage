@@ -98,7 +98,9 @@ def test_information_read_publishes_before_ack_and_reuses_receipt(bridge):
     assert db.task_email(1)["task_status"] == "open"
 
 
-def test_information_read_partial_failure_keeps_successes(bridge):
+@pytest.mark.parametrize("missing_reference", [False, True])
+def test_information_read_partial_failure_keeps_successes(bridge, missing_reference):
+    from outlook_triage.outlook import OutlookItemNotFound
     from test_information import add_information
     db, config, client = bridge
     add_information(db, datetime.now(config.timezone))
@@ -108,12 +110,15 @@ def test_information_read_partial_failure_keeps_successes(bridge):
         def __enter__(self): return self
         def __exit__(self, *args): pass
         def mark_read(self, source, store):
-            if source == "missing": raise OutlookError("missing")
+            if source == "missing":
+                raise (OutlookItemNotFound("moved or deleted") if missing_reference else OutlookError("busy"))
     job = {"id": 71, "action": "read_information", "task_ids": [1, 2], "completed_ids": []}
     process_job(db, config, client, job, logging.getLogger(), outlook_factory=Outlook)
     assert client.acks == [(71, {"task_id": 1}), (71, {"failed": True})]
     assert db.information_email(1)["is_read"] == 1
-    assert db.information_email(2)["is_read"] == 0
+    assert db.information_email(2)["is_read"] == (None if missing_reference else 0)
+    published = decrypt_payload(client.envelopes[-1], TEST_ENCRYPTION_KEY)["bridge"]["information"]
+    assert next(item for item in published if item["id"] == 2)["is_read"] == (None if missing_reference else False)
 
 
 def test_information_previews_are_encrypted_bounded_and_opt_in(bridge):

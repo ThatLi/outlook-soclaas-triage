@@ -18,7 +18,7 @@ from .config import Settings
 from .database import Database
 from .locking import AlreadyRunning, process_lock
 from .operations import run_retry, run_sync
-from .outlook import OutlookClient, OutlookError
+from .outlook import OutlookClient, OutlookError, OutlookItemNotFound
 from .relay import RelayClient, RelayError, build_payload, encrypt_payload, relay_key
 
 
@@ -164,6 +164,10 @@ def process_job(db: Database, settings: Settings, client: BridgeClient, job: dic
                                 _save_receipt(db, receipt_key, information_id, {"read": True})
                             db.set_email_read(row["message_key"], True)
                             successes.append(information_id)
+                        except OutlookItemNotFound:
+                            db.set_email_read(row["message_key"], None)
+                            logger.warning("Informational read failed (item moved or deleted)")
+                            failures.append(information_id)
                         except OutlookError:
                             failures.append(information_id)
             publish_bridge(db, settings, client, cache_previews=cache_previews, outlook_factory=outlook_factory)

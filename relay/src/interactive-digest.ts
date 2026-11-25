@@ -106,7 +106,7 @@ export async function deliverDigest(env: Env, row: DigestRow, now = new Date()):
       const updated = layout.tasks.map(task => ({ ...task, ...latest.get(task.id), status: (tasks.get(task.id)?.status ?? task.status) as CloudTask["status"] }));
       const latestInformation = new Map((data.information ?? []).map(item => [item.id, item]));
       const information = (layout.information ?? []).map(item => ({ ...item,
-        is_read: latestInformation.get(item.id)?.is_read ?? item.is_read }));
+        is_read: latestInformation.has(item.id) ? latestInformation.get(item.id)!.is_read : item.is_read }));
       informationNotes = new Map(information.map(item => [item.id, informationAnnotation(item.id, events)]));
       if (information.some((item, index) => item.is_read !== layout.information![index].is_read)) {
         await env.DB.prepare("UPDATE interactive_digests SET sealed_layout=? WHERE id=?")
