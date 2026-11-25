@@ -19,6 +19,24 @@ def _message(source_id="entry-1"):
     }
 
 
+def test_last_success_uses_completed_sync_history_including_existing_databases(settings):
+    db = Database(settings.database_file)
+    db.store_sync_batch([], "2026-11-25T20:48:10+08:00")
+    assert db.operational_status()["last_sync"] is None
+    first = db.start_run("sync")
+    db.finish_run(first, success=True)
+    db.connection.execute("UPDATE runs SET finished_at='2026-11-23T00:00:11+08:00' WHERE id=?", (first,))
+    db.connection.commit()
+    for kind, success in [("sync", False), ("retry-failed", True), ("sync", None)]:
+        run = db.start_run(kind)
+        if success is not None: db.finish_run(run, success=success)
+    db.store_sync_batch([], "2026-11-25T21:00:00+08:00")
+    assert db.get_last_received_at() == "2026-11-25T21:00:00+08:00"
+    assert db.operational_status()["last_sync"] == "2026-11-23T00:00:11+08:00"
+    assert db.digest_snapshot("2000-01-01")["last_sync"] == "2026-11-23T00:00:11+08:00"
+    db.close()
+
+
 def test_database_deduplicates_email_and_task(settings):
     db = Database(settings.database_file)
     try:

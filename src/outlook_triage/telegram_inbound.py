@@ -12,7 +12,7 @@ from .database import Database
 from .digest import build_digest
 from .locking import AlreadyRunning, process_lock
 from .operations import run_retry, run_sync
-from .outlook import OutlookClient, OutlookError
+from .outlook import OutlookClient, OutlookError, OutlookItemNotFound
 from .relay import publish_if_configured
 from .telegram import TelegramClient, TelegramError, format_digest
 from .telegram_commands import HELP_TEXT, format_body_preview, format_status, format_task_list, parse_command
@@ -239,6 +239,9 @@ def process_command(
                                 outlook.mark_read(row["source_id"], row["store_id"])
                                 db.set_email_read(row["message_key"], True)
                                 db.apply_telegram_task(update_id, information_id)
+                            except OutlookItemNotFound:
+                                db.set_email_read(row["message_key"], None)
+                                failures.append(f"#i{information_id} (moved or deleted)")
                             except (OutlookError, KeyError):
                                 failures.append(f"#i{information_id}")
                 applied = len(db.telegram_update_task_ids(update_id, status="applied"))

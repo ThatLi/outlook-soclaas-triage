@@ -27,6 +27,31 @@ def add_information(db, now, source="info", *, is_read=False, category="informat
     return message
 
 
+@pytest.mark.parametrize("missing", [True, False])
+def test_sync_missing_information_is_hidden_but_transient_errors_remain_failures(settings, missing):
+    import outlook_triage.outlook as errors
+    db = Database(settings.database_file)
+    now = datetime.now(settings.timezone)
+    add_information(db, now - timedelta(hours=1))
+    class Outlook:
+        def sync(self, *args, **kwargs): return SyncResult([], now.isoformat())
+        def is_read(self, *args):
+            if missing: raise errors.OutlookItemNotFound("item moved or deleted")
+            raise errors.OutlookUnavailable("busy")
+    class AI:
+        def verify_model(self): pass
+    synchronize(db=db, settings=settings, outlook=Outlook(), ai=AI(), rules=FilterRules(), logger=logging.getLogger())
+    assert db.information_email(1)["is_read"] == (None if missing else 0)
+    assert len(db.information(now, unread_only=True)) == (0 if missing else 1)
+    assert db.operational_status()["last_run"]["status"] == ("success" if missing else "failed")
+    assert (db.operational_status()["last_sync"] is not None) == missing
+    # A restored reference becomes visible again with its original summary and ID.
+    Outlook.is_read = lambda *args: False
+    synchronize(db=db, settings=settings, outlook=Outlook(), ai=AI(), rules=FilterRules(), logger=logging.getLogger())
+    assert db.information(now, unread_only=True)[0]["id"] == 1
+    db.close()
+
+
 def test_information_window_order_read_status_and_stable_upgrade(settings):
     now = datetime.now(settings.timezone).replace(microsecond=0)
     db = Database(settings.database_file)
@@ -136,7 +161,9 @@ def test_sync_reconciles_old_processed_information_without_classification(settin
     db.close()
 
 
-def test_local_show_and_partial_read_leave_tasks_unchanged(settings):
+@pytest.mark.parametrize("missing_reference", [False, True])
+def test_local_show_and_partial_read_leave_tasks_unchanged(settings, missing_reference):
+    from outlook_triage.outlook import OutlookItemNotFound
     db = Database(settings.database_file)
     now = datetime.now(settings.timezone)
     add_information(db, now)
@@ -148,7 +175,8 @@ def test_local_show_and_partial_read_leave_tasks_unchanged(settings):
         def __exit__(self, *args): pass
         def get_body_preview(self, *args, **kwargs): return "Original <body>"
         def mark_read(self, source, store):
-            if source == "missing": raise OutlookError("missing")
+            if source == "missing":
+                raise (OutlookItemNotFound("moved or deleted") if missing_reference else OutlookError("busy"))
             return False  # Already read in Outlook is still a success.
     class Telegram:
         def __init__(self): self.messages = []
@@ -160,7 +188,7 @@ def test_local_show_and_partial_read_leave_tasks_unchanged(settings):
     assert db.information_email(1)["is_read"] == 0
     process_command(db, settings, telegram, 2, "1", "/read #i1 #i2", logging.getLogger(), outlook_factory=Outlook)
     assert db.information_email(1)["is_read"] == 1
-    assert db.information_email(2)["is_read"] == 0
+    assert db.information_email(2)["is_read"] == (None if missing_reference else 0)
     assert db.list_tasks()[0]["status"] == "open"
     assert "Earlier successes were kept" in telegram.messages[-1]
     db.close()

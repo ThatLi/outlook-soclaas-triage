@@ -250,6 +250,20 @@ read status before acknowledging completion. Partial successes are retained and
 retries are safe. Reading directly in Outlook is reflected after synchronization.
 Cloud previews require `--cache-previews`; summary delivery does not.
 
+If Outlook reports that a saved informational reference cannot be found (for
+example after moving or deleting the message), its read status becomes unknown.
+It disappears from current briefs and loses its cached preview, while its saved
+summary and reference remain locally. This does not count as a confirmed read or
+fail an otherwise successful sync. Temporary access/connection errors still fail
+the sync. References are checked again within the 72-hour window and can reappear
+if Outlook resolves them. The bridge does not guess a replacement message when a
+move changes its identifier. Explicit read commands keep successful items and
+report unresolved items as failures.
+
+The last successful sync timestamp comes from a fully completed successful sync
+record. Saving an Inbox batch, a failed sync, or retrying classifications alone
+does not advance it. Existing databases use their recorded successful sync history.
+
 Informational `/read #i42` follows quiet task feedback: the current digest shows
 read progress, then removes confirmed read entries. Covered commands do not send
 separate queued/marked replies. The accepted command is deleted only after its

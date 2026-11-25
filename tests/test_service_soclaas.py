@@ -82,6 +82,9 @@ def test_sync_persists_metadata_task_and_delta(settings):
         assert db.get_last_received_at() == "2026-09-28T09:00:00+08:00"
         assert db.email_status("store-1:entry-1") == "processed"
         assert db.list_tasks()[0]["description"] == "Reply to Alice"
+        finished = db.connection.execute("SELECT finished_at FROM runs WHERE status='success'").fetchone()[0]
+        assert db.operational_status()["last_sync"] == finished
+        assert db.connection.execute("SELECT last_success_at FROM sync_state").fetchone()[0] == finished
     finally:
         db.close()
 
@@ -100,6 +103,7 @@ def test_sync_keeps_failed_message_for_retry(settings):
         assert counts["failed"] == 1
         assert db.pending_messages()[0]["source_id"] == "entry-1"
         assert db.get_last_received_at() == "2026-09-28T09:00:00+08:00"
+        assert db.operational_status()["last_sync"] is None
     finally:
         db.close()
 
